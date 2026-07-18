@@ -2,6 +2,7 @@ import functools
 import hmac
 import json
 import os
+import time
 
 import boto3
 import sqlglot
@@ -24,6 +25,9 @@ ATHENA_OUTPUT_LOCATION = os.getenv("ATHENA_OUTPUT_LOCATION")
 MAX_DAYS = int(os.getenv("ALLOWED_TIME_RANGE_MAX_DAYS", "90"))
 MAX_ROWS = 1000
 SUMMARY_ROWS = 200
+# Conversational memory (DynamoDB). Optional: unset locally → memory disabled.
+SESSION_TABLE = os.getenv("DYNAMODB_SESSION_TABLE")
+HISTORY_TTL_SECONDS = 24 * 3600  # sessions self-expire after 24h (DynamoDB TTL)
 
 app = FastAPI(title="TrailWhisperer Orchestrator")
 app.add_middleware(
@@ -39,6 +43,65 @@ def _bedrock():
 @functools.lru_cache(maxsize=1)
 def _athena():
     return boto3.client("athena", region_name=REGION)
+
+
+@functools.lru_cache(maxsize=1)
+def _sessions_table():
+    return boto3.resource("dynamodb", region_name=REGION).Table(SESSION_TABLE)
+
+
+# --- Conversational memory (best-effort; never breaks a request) -----------
+
+def history_get(session_id: str | None) -> list[dict]:
+    """Prior turns for a session as [{role, content}], oldest first."""
+    if not (session_id and SESSION_TABLE):
+        return []
+    try:
+        item = _sessions_table().get_item(Key={"session_id": session_id}).get("Item")
+    except ClientError:
+        return []
+    return (item or {}).get("messages", [])
+
+
+def history_append(session_id: str | None, role: str, text: str):
+    """Append one turn to a session with a refreshed 24h TTL."""
+    if not (session_id and SESSION_TABLE and text):
+        return
+    msg = {"role": role, "content": text[:8000]}
+    try:
+        _sessions_table().update_item(
+            Key={"session_id": session_id},
+            UpdateExpression=(
+                "SET messages = list_append(if_not_exists(messages, :empty), :m), "
+                "#ttl = :ttl"
+            ),
+            ExpressionAttributeNames={"#ttl": "ttl"},
+            ExpressionAttributeValues={
+                ":empty": [], ":m": [msg],
+                ":ttl": int(time.time()) + HISTORY_TTL_SECONDS,
+            },
+        )
+    except ClientError:
+        pass  # memory is a convenience, not a hard dependency
+
+
+def to_converse_messages(history: list[dict]) -> list[dict]:
+    """Turn stored {role, content} turns into Bedrock Converse messages.
+    Merges consecutive same-role turns (a query whose results were never stored
+    leaves a dangling user turn) so the required user/assistant alternation — and
+    a leading user turn — always holds."""
+    msgs: list[dict] = []
+    for m in history:
+        role, text = m.get("role"), m.get("content")
+        if role not in ("user", "assistant") or not text:
+            continue
+        if msgs and msgs[-1]["role"] == role:
+            msgs[-1]["content"].append({"text": text})
+        else:
+            msgs.append({"role": role, "content": [{"text": text}]})
+    while msgs and msgs[0]["role"] != "user":
+        msgs.pop(0)
+    return msgs
 
 
 @functools.lru_cache(maxsize=1)
@@ -144,12 +207,20 @@ FEWSHOT = (
 )
 
 SQL_SYSTEM = (
-    "You translate natural-language audit questions into a single Amazon Athena (Trino SQL) query.\n"
-    "Pick exactly ONE whitelisted table for the question:\n"
+    "You are a cloud security analyst assistant investigating AWS CloudTrail and VPC Flow "
+    "Logs with an auditor. You can see the earlier turns of this conversation.\n"
+    "Choose ONE of two responses each turn:\n"
+    "1) ANSWER FROM MEMORY: if the question can be answered from the conversation so far "
+    "(a follow-up about data already returned, a clarification, or a general question), reply "
+    "directly in plain text. Do NOT call any tool and do NOT invent data you were not given.\n"
+    "2) QUERY THE LOGS: if answering needs NEW data from the logs, call the `query_athena` tool "
+    "with a single Athena (Trino SQL) SELECT following ALL rules below. Put the SQL ONLY in the "
+    "tool's `sql` argument — never in your text reply.\n"
+    "When you query, pick exactly ONE whitelisted table for the question:\n"
     f"- `{GLUE_TABLE}` — AWS API/management activity (who did what) from CloudTrail.\n"
     f"- `{GLUE_VPC_TABLE}` — network traffic (connections, IPs, ports, accepted/rejected flows) from VPC Flow Logs.\n"
-    "RULES:\n"
-    "- Output ONLY the SQL, no prose, no markdown fences.\n"
+    "SQL RULES (for the `query_athena` `sql` argument):\n"
+    "- The `sql` argument holds ONLY the SQL — no prose, no markdown fences.\n"
     "- Exactly one read-only SELECT. Never INSERT/UPDATE/DELETE/CREATE/DROP/ALTER/UNLOAD.\n"
     f"- Query only the whitelisted tables (`{GLUE_TABLE}` and/or `{GLUE_VPC_TABLE}`); never any other table.\n"
     "- CROSS-LOG CORRELATION: when a question spans BOTH what someone did (API activity) AND their "
@@ -201,32 +272,82 @@ EXPLAIN_SYSTEM = (
 )
 
 
+# Bedrock Tool Use: the model calls this to fetch NEW data; otherwise it answers
+# in plain text from conversation memory. We never auto-run the returned SQL —
+# it still goes through the guardrail + human approval (constraint #2).
+QUERY_TOOL = {
+    "tools": [{
+        "toolSpec": {
+            "name": "query_athena",
+            "description": (
+                "Run a read-only Athena SQL query against the CloudTrail / VPC Flow Logs "
+                "tables to fetch NEW data needed to answer the question. Only call this when "
+                "the answer requires querying the logs; if the conversation already contains "
+                "the answer, reply in plain text instead of calling this tool."
+            ),
+            "inputSchema": {"json": {
+                "type": "object",
+                "properties": {
+                    "sql": {
+                        "type": "string",
+                        "description": "A single read-only Trino SELECT that follows every stated rule (mandatory dt partition filter, time-window predicate, whitelisted tables only).",
+                    }
+                },
+                "required": ["sql"],
+            }},
+        }
+    }]
+}
+
+
 class GenerateRequest(BaseModel):
     question: str = Field(min_length=3, max_length=2000)
     model_id: str | None = None
+    session_id: str | None = Field(default=None, max_length=128)
 
 
 class ExecuteRequest(BaseModel):
     sql: str = Field(min_length=8)
 
 
-def _invoke(system: str, user: str, max_tokens: int = 1024, model_id: str | None = None) -> str:
+def _converse(system: str, messages: list[dict], tool_config: dict | None = None,
+              max_tokens: int = 1024, model_id: str | None = None) -> dict:
     # Converse gives a single schema across all Bedrock chat models
     # (Claude, Amazon Nova, Qwen, Llama, Mistral, DeepSeek, ...), so the same
     # code works whichever model the user selects.
+    kwargs = dict(
+        modelId=model_id or MODEL_ID,
+        system=[{"text": system}],
+        messages=messages,
+        inferenceConfig={"maxTokens": max_tokens, "temperature": 0},
+    )
+    if tool_config:
+        kwargs["toolConfig"] = tool_config
     try:
-        resp = _bedrock().converse(
-            modelId=model_id or MODEL_ID,
-            system=[{"text": system}],
-            messages=[{"role": "user", "content": [{"text": user}]}],
-            inferenceConfig={"maxTokens": max_tokens, "temperature": 0},
-        )
+        return _bedrock().converse(**kwargs)
     except ClientError as e:
         raise HTTPException(502, f"bedrock error: {e.response['Error'].get('Message', str(e))}")
+
+
+def _invoke(system: str, user: str, max_tokens: int = 1024, model_id: str | None = None) -> str:
+    resp = _converse(system, [{"role": "user", "content": [{"text": user}]}],
+                     max_tokens=max_tokens, model_id=model_id)
     blocks = resp["output"]["message"]["content"]
     # Reasoning models (Qwen thinking, DeepSeek-R1) emit a reasoning block first,
     # then the answer — take the first text block.
     return next((b["text"] for b in blocks if "text" in b), "").strip()
+
+
+def _tool_input(resp: dict, name: str) -> dict | None:
+    """The tool-call input if the model invoked `name`, else None."""
+    for b in resp["output"]["message"]["content"]:
+        if b.get("toolUse", {}).get("name") == name:
+            return b["toolUse"].get("input", {})
+    return None
+
+
+def _text_of(resp: dict) -> str:
+    return next((b["text"] for b in resp["output"]["message"]["content"] if "text" in b), "").strip()
 
 
 def _clean_sql(text: str) -> str:
@@ -369,20 +490,51 @@ def health():
 
 @app.post("/api/generate-sql", dependencies=[Depends(require_auth)])
 def generate_sql(req: GenerateRequest):
-    sql = _clean_sql(_invoke(SQL_SYSTEM, req.question, model_id=req.model_id))
+    # Agentic routing: give the model the conversation so far + the query_athena
+    # tool. It either answers from memory (plain text) or calls the tool with SQL.
+    convo = history_get(req.session_id) + [{"role": "user", "content": req.question}]
+    resp = _converse(SQL_SYSTEM, to_converse_messages(convo),
+                     tool_config=QUERY_TOOL, model_id=req.model_id)
+    tool = _tool_input(resp, "query_athena")
+
+    if tool is None:
+        # No query needed — the model answered directly. Persist the exchange so
+        # later turns keep the context, and return it for immediate display.
+        answer = _text_of(resp) or "I don't have enough information to answer that yet."
+        history_append(req.session_id, "user", req.question)
+        history_append(req.session_id, "assistant", answer)
+        return {"chat_response": answer, "session_id": req.session_id}
+
+    sql = _clean_sql(tool.get("sql", ""))
     ok, reason = validate_sql(sql)
     # Up to two self-correction rounds: feed the rejection reason + bad SQL back to
     # the model. Smaller models (e.g. Nova) often mangle string-literal quoting and
-    # need more than one shot to recover.
+    # need more than one shot to recover. Re-issue as a fresh turn (proposed SQL +
+    # correction request) to preserve user/assistant alternation.
     for _ in range(2):
         if ok:
             break
-        sql = _clean_sql(
-            _invoke(SQL_SYSTEM, f"{req.question}\n\nYour previous SQL was rejected: {reason}\nSQL was:\n{sql}\nFix it.", model_id=req.model_id)
-        )
+        convo = convo + [
+            {"role": "assistant", "content": f"(proposed query) {sql}"},
+            {"role": "user", "content": (
+                f"That query was rejected by the guardrail: {reason}. "
+                "Call query_athena again with corrected SQL."
+            )},
+        ]
+        resp = _converse(SQL_SYSTEM, to_converse_messages(convo),
+                         tool_config=QUERY_TOOL, model_id=req.model_id)
+        tool = _tool_input(resp, "query_athena")
+        if tool is None:
+            break
+        sql = _clean_sql(tool.get("sql", ""))
         ok, reason = validate_sql(sql)
     if not ok:
         raise HTTPException(422, f"could not produce a safe query: {reason}")
+
+    # Persist only the user turn now; the assistant's result is appended by
+    # /api/results after Athena runs, so memory reflects the actual returned data.
+    history_append(req.session_id, "user", req.question)
+
     # Best-effort plain-language explanation; never fail generation if it errors.
     explanation = ""
     try:
@@ -391,7 +543,7 @@ def generate_sql(req: GenerateRequest):
         )
     except HTTPException:
         explanation = ""
-    return {"sql": sql, "explanation": explanation}
+    return {"sql": sql, "explanation": explanation, "session_id": req.session_id}
 
 
 @app.post("/api/execute-sql", dependencies=[Depends(require_auth)])
@@ -458,7 +610,8 @@ def _summarize(question: str, rows: list, model_id: str | None = None):
 
 
 @app.get("/api/results/{execution_id}", dependencies=[Depends(require_auth)])
-def get_results(execution_id: str = Path(min_length=8), question: str = "", model_id: str = ""):
+def get_results(execution_id: str = Path(min_length=8), question: str = "",
+                model_id: str = "", session_id: str = ""):
     try:
         info = _athena().get_query_execution(QueryExecutionId=execution_id)["QueryExecution"]
     except ClientError as e:
@@ -475,6 +628,17 @@ def get_results(execution_id: str = Path(min_length=8), question: str = "", mode
 
     columns, rows = _fetch_rows(execution_id)
     summary, flags = _summarize(question, rows, model_id or None) if rows else ("No matching events were found.", [])
+
+    # Append the result to conversation memory so follow-up questions can reason
+    # over what was actually returned (a compact assistant turn, not raw rows).
+    if session_id:
+        mem = f"Results for the question: {question}\nSummary: {summary}"
+        if flags:
+            mem += "\nFlags: " + "; ".join(str(f) for f in flags)
+        if rows:
+            mem += "\nSample rows (JSON): " + json.dumps(rows[:20], default=str)[:4000]
+        history_append(session_id, "assistant", mem)
+
     return {
         "status": "succeeded",
         "columns": columns,

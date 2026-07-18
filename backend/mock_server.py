@@ -237,11 +237,24 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/generate-sql":
             data = self._read_json()
             question = (data.get("question") or "").strip()
+            session_id = data.get("session_id")
             if len(question) < 3:
                 return self._send(422, {"detail": "question too short"})
-            sql, *_ = _scenario(question)
             time.sleep(0.6)  # feel like a real model round-trip
-            return self._send(200, {"sql": sql, "explanation": _explain(question)})
+            # Agentic routing demo: conversational turns (greetings/thanks/meta
+            # questions) are answered from "memory" as plain text; everything else
+            # proposes a query for approval, mirroring the real Tool Use routing.
+            if re.match(r"^(hi|hello|hey|thanks|thank you|who are you|what can you)\b", question.lower()):
+                return self._send(200, {
+                    "chat_response": (
+                        "I'm your CloudTrail & VPC Flow Logs analyst. Ask me things like "
+                        "\"failed console logins today\" and I'll draft a read-only query for "
+                        "your approval, then summarize what the logs show."
+                    ),
+                    "session_id": session_id,
+                })
+            sql, *_ = _scenario(question)
+            return self._send(200, {"sql": sql, "explanation": _explain(question), "session_id": session_id})
 
         if self.path == "/api/execute-sql":
             data = self._read_json()

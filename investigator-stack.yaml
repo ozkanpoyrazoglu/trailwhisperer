@@ -262,6 +262,23 @@ Resources:
         ResultConfiguration:
           OutputLocation: !Sub "s3://${AthenaResultsBucket}/results/"
 
+  # Conversational memory: per-session chat history for Bedrock Tool Use routing.
+  # PAY_PER_REQUEST keeps it ephemeral/zero-idle-cost; TTL auto-expires sessions.
+  ChatSessionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-chat-sessions"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: session_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: session_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
   OrchestratorRole:
     Type: AWS::IAM::Role
     Properties:
@@ -332,6 +349,13 @@ Resources:
                 Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource: !Ref AuthTokenSecret
+              - Sid: ChatSessions
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt ChatSessionsTable.Arn
 
   OrchestratorFunction:
     Type: AWS::Lambda::Function
@@ -352,6 +376,7 @@ Resources:
           AUTH_SECRET_ARN: !Ref AuthTokenSecret
           BYTES_SCANNED_CUTOFF: !Ref BytesScannedCutoff
           ALLOWED_TIME_RANGE_MAX_DAYS: !Ref AllowedTimeRangeMaxDays
+          DYNAMODB_SESSION_TABLE: !Ref ChatSessionsTable
       Code:
         S3Bucket: !Sub "${ArtifactBucketPrefix}-${AWS::Region}"
         S3Key: !Sub "${ArtifactVersion}/backend.zip"

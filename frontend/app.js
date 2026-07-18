@@ -10,6 +10,7 @@ const API =
   new URLSearchParams(location.search).get("api") ||
   "http://localhost:8000";
 const TOKEN_KEY = "trailwhisperer.token";
+const SESSION_KEY = "trailwhisperer.session";
 const AUTO_KEY = "trailwhisperer.autorun";
 const AUTO_SECONDS = 5;
 const MODEL_KEY = "trailwhisperer.model";
@@ -39,6 +40,15 @@ const el = {
 let token = localStorage.getItem(TOKEN_KEY) || "";
 let pending = null; // { question } awaiting SQL approval
 let busy = false;
+
+// Stable per-browser session id ties this thread's turns to server-side
+// conversational memory (DynamoDB). Persisted so a reload keeps the context.
+let sessionId = localStorage.getItem(SESSION_KEY);
+if (!sessionId) {
+  sessionId = (crypto.randomUUID && crypto.randomUUID()) ||
+    `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  localStorage.setItem(SESSION_KEY, sessionId);
+}
 
 /* ------------------------------- helpers -------------------------------- */
 const esc = (s) =>
@@ -182,6 +192,15 @@ function addError(title, detail) {
 
 function addNote(text) {
   return addEntry(`<div class="status" style="border-style:dashed">${esc(text)}</div>`);
+}
+
+// A plain-text analyst reply (model answered from conversation memory — no query).
+function addAssistant(text) {
+  return addEntry(`
+    <div class="card">
+      <div class="card-head"><span class="tick"></span>Analyst</div>
+      <div class="narrative"><p>${esc(text)}</p></div>
+    </div>`);
 }
 
 function renderResults(data, question) {
@@ -363,9 +382,12 @@ async function investigate(question) {
   setBusy(true);
   const status = addThinking(THINK_GENERATE);
   try {
-    const { sql, explanation } = await api("/api/generate-sql", { method: "POST", body: { question, model_id: currentModel() } });
+    const resp = await api("/api/generate-sql", { method: "POST", body: { question, model_id: currentModel(), session_id: sessionId } });
     status.stop(); status.remove();
-    openSql(sql, question, explanation);
+    // Agentic routing: the model either answered from memory (chat_response) or
+    // proposed a query (sql) that still needs human approval before it runs.
+    if (resp.chat_response) addAssistant(resp.chat_response);
+    else openSql(resp.sql, question, resp.explanation);
   } catch (e) {
     status.stop(); status.remove();
     addError("Couldn't draft a safe query", e.message);
@@ -399,7 +421,7 @@ async function runApproved() {
 }
 
 async function pollResults(id, question) {
-  const q = `?question=${encodeURIComponent(question)}&model_id=${encodeURIComponent(currentModel())}`;
+  const q = `?question=${encodeURIComponent(question)}&model_id=${encodeURIComponent(currentModel())}&session_id=${encodeURIComponent(sessionId)}`;
   for (let i = 0; i < POLL_MAX; i++) {
     const data = await api(`/api/results/${id}${q}`);
     if (data.status !== "running") return data;
