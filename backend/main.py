@@ -76,7 +76,10 @@ CRIB = (
     "errorcode/errormessage: set when the call failed/was denied. "
     "requestparameters/responseelements: JSON strings. "
     "awsregion, recipientaccountid. "
-    "Partitions: account, region, dt (dt format 'yyyy/MM/dd')."
+    "Partitions: account, region, dt. "
+    "dt is a STRING partition key formatted 'yyyy/MM/dd' (e.g. '2026/07/18'); "
+    "it is MANDATORY in WHERE for partition pruning and must be filtered as "
+    "dt >= date_format(current_timestamp - interval 'N' day, '%Y/%m/%d')."
 )
 
 VPC_CRIB = (
@@ -87,21 +90,27 @@ VPC_CRIB = (
     "start, end: Unix epoch SECONDS of the flow window "
     "(`end` is a reserved word — always quote it as \"end\"). "
     "action: 'ACCEPT' or 'REJECT'. log_status: 'OK'/'NODATA'/'SKIPDATA'. "
-    "Partitions: account, region, dt (dt format 'yyyy/MM/dd')."
+    "Partitions: account, region, dt. "
+    "dt is a STRING partition key formatted 'yyyy/MM/dd' (e.g. '2026/07/18'); "
+    "it is MANDATORY in WHERE for partition pruning and must be filtered as "
+    "dt >= date_format(current_timestamp - interval 'N' day, '%Y/%m/%d')."
 )
 
 FEWSHOT = (
     "Q: Who changed a security group last week?\n"
     f"SQL: SELECT eventtime, useridentity.arn, eventname, sourceipaddress FROM {GLUE_TABLE} "
-    "WHERE eventname IN ('AuthorizeSecurityGroupIngress','RevokeSecurityGroupIngress','AuthorizeSecurityGroupEgress') "
+    "WHERE dt >= date_format(current_timestamp - interval '7' day, '%Y/%m/%d') "
+    "AND eventname IN ('AuthorizeSecurityGroupIngress','RevokeSecurityGroupIngress','AuthorizeSecurityGroupEgress') "
     "AND eventtime >= to_iso8601(current_timestamp - interval '7' day) ORDER BY eventtime DESC;\n\n"
     "Q: Failed console logins in the last 3 days?\n"
     f"SQL: SELECT eventtime, useridentity.username, sourceipaddress, errormessage FROM {GLUE_TABLE} "
-    "WHERE eventname = 'ConsoleLogin' AND errorcode IS NOT NULL "
+    "WHERE dt >= date_format(current_timestamp - interval '3' day, '%Y/%m/%d') "
+    "AND eventname = 'ConsoleLogin' AND errorcode IS NOT NULL "
     "AND eventtime >= to_iso8601(current_timestamp - interval '3' day) ORDER BY eventtime DESC;\n\n"
     "Q: Which hosts had rejected connections on port 22 yesterday?\n"
     f'SQL: SELECT from_unixtime("start") AS flow_start, srcaddr, dstaddr, dstport, action FROM {GLUE_VPC_TABLE} '
-    "WHERE action = 'REJECT' AND dstport = 22 "
+    "WHERE dt >= date_format(current_timestamp - interval '1' day, '%Y/%m/%d') "
+    "AND action = 'REJECT' AND dstport = 22 "
     "AND \"start\" >= to_unixtime(current_timestamp - interval '1' day) ORDER BY \"start\" DESC;"
 )
 
@@ -114,8 +123,14 @@ SQL_SYSTEM = (
     "- Output ONLY the SQL, no prose, no markdown fences.\n"
     "- Exactly one read-only SELECT. Never INSERT/UPDATE/DELETE/CREATE/DROP/ALTER/UNLOAD.\n"
     f"- Query only one of the whitelisted tables (`{GLUE_TABLE}` or `{GLUE_VPC_TABLE}`); never another table or a join across them.\n"
-    "- ALWAYS include a time-window predicate in WHERE. If the user gives no range, "
-    f"default to the last {MAX_DAYS} days and never exceed it:\n"
+    "- MANDATORY PARTITION PRUNING: EVERY query MUST filter the `dt` partition key in WHERE, "
+    "using exactly this form (N = number of days in the window):\n"
+    "      dt >= date_format(current_timestamp - interval 'N' day, '%Y/%m/%d')\n"
+    "  `dt` is a STRING partition formatted 'yyyy/MM/dd'. A query WITHOUT a `dt` filter is REJECTED — "
+    "never emit one. This applies to BOTH tables.\n"
+    "- ALSO include a precise time-window predicate on the event's own timestamp. If the user gives no "
+    f"range, default to the last {MAX_DAYS} days and never exceed it. Use the SAME N for `dt` and the "
+    "timestamp column:\n"
     "    * CloudTrail: filter `eventtime` (ISO8601 string) with to_iso8601(current_timestamp - interval 'N' day).\n"
     "    * VPC Flow Logs: filter \"start\" (Unix epoch seconds, quote the reserved word \"end\" too) "
     "with to_unixtime(current_timestamp - interval 'N' day).\n"
@@ -207,9 +222,13 @@ def validate_sql(sql: str):
     if not wheres:
         return False, "a time-window filter is required"
     cols = {c.name.lower() for w in wheres for c in w.find_all(exp.Column)}
-    # CloudTrail uses eventtime/dt; VPC Flow Logs use start/end (dt partition shared).
-    if not ({"eventtime", "dt", "start", "end"} & cols):
-        return False, "WHERE must constrain a time window (eventtime/dt for CloudTrail, start/end for VPC flow logs)"
+    # Partition pruning is non-negotiable: `dt` (the yyyy/MM/dd partition key, shared by
+    # both tables) MUST be in the WHERE clause so Athena scans only the needed partitions.
+    if "dt" not in cols:
+        return False, (
+            "WHERE must filter the `dt` partition key for partition pruning, e.g. "
+            "dt >= date_format(current_timestamp - interval 'N' day, '%Y/%m/%d')"
+        )
     return True, None
 
 
