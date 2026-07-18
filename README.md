@@ -56,17 +56,37 @@ API Gateway (HTTP API)  →  Lambda (FastAPI + Mangum, Python 3.13)
 
 ## Deploying to AWS
 
+Deployment is **one click**: the CloudFormation stack pulls the packaged backend from a release bucket, and a bundled custom resource publishes the SPA (with the live API URL baked into `config.js`) into S3 — no manual Lambda upload, no manual S3 sync, no `?api=` wiring.
+
+There are two audiences:
+
+- **Deploying an existing release** → just click *Launch Stack* (or run the CLI command). Start here.
+- **Publishing a release** (you maintain the artifacts) → see [Publishing a release](#publishing-a-release-maintainers) first, once.
+
 ### Prerequisites
 
 - An **existing CloudTrail → S3** setup (management events delivered to a bucket). Optionally a **VPC Flow Logs → S3** bucket (default fields, delivered to S3).
 - **Amazon Bedrock model access** enabled in your region for the model you intend to use (default: `anthropic.claude-3-5-sonnet-20241022-v2:0`). Enable it in the Bedrock console under *Model access*.
-- AWS CLI configured with permissions to create the stack (`--capabilities CAPABILITY_IAM`).
+- A **published release** in the region you're deploying to (an artifact bucket `trailwhisperer-artifacts-<region>` containing `backend.zip` + frontend). If you're the maintainer and haven't published yet, do [that](#publishing-a-release-maintainers) first.
 
-> **Region note:** deploy in the **same region** as your Athena/Glue and Bedrock model access.
+> **Region note:** deploy in the **same region** as your Athena/Glue, Bedrock model access, **and the artifact bucket** (Lambda code buckets are region-local).
 
-### 1. Deploy the CloudFormation stack
+### Option A — One-click "Launch Stack" (Console)
 
-The whole system is one importable template: `investigator-stack.yaml`.
+Once a release is published, `scripts/publish.sh` prints a **Launch Stack URL** per region. Put it behind a button in your fork's README:
+
+```markdown
+[![Launch Stack](https://s3.amazonaws.com/cloudformation-examples/cloudformation-launch-stack.png)](https://us-east-1.console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/create/review?templateURL=https://trailwhisperer-artifacts-us-east-1.s3.us-east-1.amazonaws.com/v1/stack.yaml&stackName=ct-nl-investigator&param_ArtifactVersion=v1)
+```
+
+Clicking it opens the CloudFormation console with the template pre-loaded. Then:
+
+1. Fill in the **Parameters** (see the table below) — at minimum `CloudTrailLogBucketName` and `VpcFlowLogsBucketName`.
+2. Check **"I acknowledge that AWS CloudFormation might create IAM resources."**
+3. **Create stack** and wait for **CREATE_COMPLETE**.
+4. Open the **Outputs** tab → click `UiUrl`. That's the working console.
+
+### Option B — Deploy via the CLI
 
 ```bash
 aws cloudformation deploy \
@@ -76,6 +96,7 @@ aws cloudformation deploy \
   --parameter-overrides \
     CloudTrailLogBucketName=my-org-cloudtrail-logs \
     VpcFlowLogsBucketName=my-org-vpc-flow-logs \
+    ArtifactVersion=v1 \
     BedrockModelId=anthropic.claude-3-5-sonnet-20241022-v2:0
 ```
 
@@ -85,6 +106,8 @@ aws cloudformation deploy \
 |---|---|---|
 | `CloudTrailLogBucketName` | *(required)* | Existing S3 bucket receiving CloudTrail management events. |
 | `VpcFlowLogsBucketName` | *(required)* | Existing S3 bucket receiving VPC Flow Logs (default fields). |
+| `ArtifactBucketPrefix` | `trailwhisperer-artifacts` | Release bucket prefix; real bucket is `<prefix>-<region>`. |
+| `ArtifactVersion` | `v1` | Release version = S3 key prefix under the artifact bucket. |
 | `GlueDatabaseName` | `trailwhisperer_db` | Glue database created by the stack. |
 | `GlueTableName` | `cloudtrail_logs` | CloudTrail Glue table name. |
 | `VpcFlowLogsTableName` | `vpc_flow_logs` | VPC Flow Logs Glue table name. |
@@ -92,53 +115,55 @@ aws cloudformation deploy \
 | `BytesScannedCutoff` | `1073741824` (1 GB) | Per-query bytes-scanned cap (runaway-cost guard). |
 | `AllowedTimeRangeMaxDays` | `90` | Max time window (days) the orchestrator allows per query. |
 
-The stack creates: the Athena results bucket (7-day lifecycle) and SPA bucket, a CloudFront distribution (Origin Access Control), the Athena Workgroup with the bytes-scanned cutoff, the Glue database + two partition-projected tables, the auth-token secret (auto-generated), the Lambda + HTTP API, and a least-privilege IAM role.
+The stack creates: the Athena results bucket (7-day lifecycle) and SPA bucket, a CloudFront distribution (Origin Access Control), the Athena Workgroup with the bytes-scanned cutoff, the Glue database + two partition-projected tables, the auth-token secret (auto-generated), the orchestrator Lambda (code from the release bucket) + HTTP API, a least-privilege IAM role, and the SPA-deployer custom resource that publishes the frontend + `config.js`.
 
-### 2. Read the stack outputs
+### After it's up
+
+Get the URL and login token:
 
 ```bash
+# Console URL
 aws cloudformation describe-stacks --stack-name ct-nl-investigator \
-  --query 'Stacks[0].Outputs' --output table
-```
+  --query "Stacks[0].Outputs[?OutputKey=='UiUrl'].OutputValue" --output text
 
-| Output | Use |
-|---|---|
-| `UiUrl` | CloudFront URL of the web console. |
-| `ApiUrl` | HTTP API endpoint the SPA calls. |
-| `SpaBucketName` | S3 bucket to upload the frontend into. |
-| `AuthSecretArn` | Secrets Manager ARN holding the API token (log in with its value). |
-| `AthenaWorkGroupName` | The Athena Workgroup enforcing the cost cutoff. |
-
-### 3. Upload the frontend
-
-The Lambda ships a placeholder handler; upload the SPA to the `SpaBucketName` bucket:
-
-```bash
-aws s3 sync ./frontend "s3://$(aws cloudformation describe-stacks \
-  --stack-name ct-nl-investigator \
-  --query "Stacks[0].Outputs[?OutputKey=='SpaBucketName'].OutputValue" --output text)/"
-```
-
-### 4. Retrieve your auth token
-
-```bash
+# Auth token (paste into the login modal on first load)
 aws secretsmanager get-secret-value \
   --secret-id "$(aws cloudformation describe-stacks --stack-name ct-nl-investigator \
     --query "Stacks[0].Outputs[?OutputKey=='AuthSecretArn'].OutputValue" --output text)" \
   --query SecretString --output text
 ```
 
-### 5. Open the console
+Open `UiUrl`, paste the token into the login modal (stored in `localStorage`, sent as `Authorization: Bearer <token>`). The API endpoint is already wired via `config.js` — nothing else to configure.
 
-Browse to the `UiUrl`. On first load, paste the token from step 4 into the login modal (stored in `localStorage`, sent as `Authorization: Bearer <token>`). The SPA reads the backend base URL from an `?api=<ApiUrl>` query parameter (defaulting to `http://localhost:8000` for local dev) — point it at your `ApiUrl`.
+Other outputs: `ApiUrl` (HTTP API endpoint), `SpaBucketName`, `AthenaWorkGroupName`.
+
+---
+
+## Publishing a release (maintainers)
+
+The Launch Stack button needs the packaged artifacts hosted in a regional bucket. Publish once per version, per region you want to support:
+
+```bash
+# builds dist/backend.zip (manylinux wheels) and uploads backend + stack + frontend
+scripts/publish.sh v1 us-east-1 eu-west-1
+```
+
+This runs `scripts/build-backend.sh` (packages `backend/` + its deps into a Python 3.13 Lambda zip using manylinux wheels — works on macOS/Linux, no Docker), then for each region creates `trailwhisperer-artifacts-<region>` if missing and uploads `backend.zip`, `stack.yaml`, and `frontend/`. It prints a ready-to-use **Launch Stack URL** for each region.
+
+- **Backend arch:** set `LAMBDA_ARCH=aarch64` before building for arm64 Lambdas (default `x86_64`).
+- **Bucket prefix:** override with `ARTIFACT_BUCKET_PREFIX=...` (must match the `ArtifactBucketPrefix` stack parameter).
+
+> **⚠️ Public distribution — security note.** By default the artifact bucket is **private**, so only principals in the bucket's **own AWS account** can deploy from it (fine for your own/org use). To let *anyone* deploy from a public Launch Stack link, run `PUBLIC=1 scripts/publish.sh ...` to make the release objects world-readable. Only do this for artifacts you intend to distribute publicly — the `backend.zip`, template, and frontend become downloadable by anyone. Never put secrets in the artifact bucket.
 
 ### Teardown
 
-Everything is one stack, so cleanup is one command (empty the S3 buckets first if they contain objects):
+Everything is one stack, and the SPA-deployer custom resource empties the stack-owned S3 buckets (SPA + Athena results) on delete, so cleanup is genuinely one command:
 
 ```bash
 aws cloudformation delete-stack --stack-name ct-nl-investigator
 ```
+
+(This does not touch your source CloudTrail/VPC log buckets or the release/artifact bucket — those are external inputs.)
 
 ---
 
@@ -180,7 +205,10 @@ The default local auth token is `local-dev-token` (from `docker-compose.yml`); u
 
 ```
 backend/                  FastAPI app (main.py), Dockerfile, requirements, mock_server.py
-frontend/                 Vanilla JS SPA (index.html, style.css, app.js) — no build step
+  requirements-lambda.txt   Lambda-only deps (no uvicorn; boto3 from runtime)
+frontend/                 Vanilla JS SPA (index.html, style.css, app.js, config.js) — no build step
+scripts/build-backend.sh  Package backend/ into dist/backend.zip (manylinux wheels)
+scripts/publish.sh        Publish a release to regional artifact buckets + print Launch Stack URL
 investigator-stack.yaml   One-click CloudFormation template (the whole system)
 docker-compose.yml        Local dev: backend (Uvicorn) + static frontend
 AGENT_CONTEXT.md          Canonical architecture summary

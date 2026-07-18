@@ -4,7 +4,11 @@
 
 "use strict";
 
-const API = new URLSearchParams(location.search).get("api") || "http://localhost:8000";
+// API base resolution order: deploy-time config.js (set by the stack) → ?api= override → local dev.
+const API =
+  (window.TRAILWHISPERER_CONFIG && window.TRAILWHISPERER_CONFIG.apiBase) ||
+  new URLSearchParams(location.search).get("api") ||
+  "http://localhost:8000";
 const TOKEN_KEY = "trailwhisperer.token";
 const AUTO_KEY = "trailwhisperer.autorun";
 const AUTO_SECONDS = 5;

@@ -1,0 +1,6 @@
+# Runtime dependencies for the Lambda package (scripts/build-backend.sh).
+# Excludes uvicorn (dev server only) and boto3 (provided by the Lambda runtime).
+fastapi==0.115.6
+mangum==0.19.0
+pydantic==2.10.4
+sqlglot==26.0.1

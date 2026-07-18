@@ -32,6 +32,17 @@ Parameters:
     Type: Number
     Default: 90
     Description: Max eventTime window (days) the orchestrator will allow per query.
+  ArtifactBucketPrefix:
+    Type: String
+    Default: trailwhisperer-artifacts
+    Description: >
+      Prefix of the public release bucket holding the packaged backend + frontend.
+      The actual bucket is "<prefix>-<region>" (must exist in THIS region — Lambda
+      code buckets are region-local). Published via scripts/publish.sh.
+  ArtifactVersion:
+    Type: String
+    Default: v1
+    Description: Release version = S3 key prefix under the artifact bucket (e.g. v1).
 
 Resources:
 
@@ -332,14 +343,8 @@ Resources:
           BYTES_SCANNED_CUTOFF: !Ref BytesScannedCutoff
           ALLOWED_TIME_RANGE_MAX_DAYS: !Ref AllowedTimeRangeMaxDays
       Code:
-        ZipFile: |
-          import json
-          def handler(event, context):
-              return {
-                  "statusCode": 200,
-                  "headers": {"content-type": "application/json"},
-                  "body": json.dumps({"status": "placeholder - deploy real backend (Phase 3/5)"}),
-              }
+        S3Bucket: !Sub "${ArtifactBucketPrefix}-${AWS::Region}"
+        S3Key: !Sub "${ArtifactVersion}/backend.zip"
 
   HttpApi:
     Type: AWS::ApiGatewayV2::Api
@@ -380,6 +385,127 @@ Resources:
       Action: lambda:InvokeFunction
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*"
+
+  # ---------------------------------------------------------------------------
+  # One-click glue: a custom resource that publishes the SPA into SpaBucket,
+  # bakes the live API URL into config.js, and empties the stack-owned buckets
+  # on delete (so `delete-stack` succeeds without a manual empty step).
+  # ---------------------------------------------------------------------------
+  SpaDeployerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: spa-deployer
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadArtifacts
+                Effect: Allow
+                Action: [s3:GetObject, s3:ListBucket]
+                Resource:
+                  - !Sub "arn:aws:s3:::${ArtifactBucketPrefix}-${AWS::Region}"
+                  - !Sub "arn:aws:s3:::${ArtifactBucketPrefix}-${AWS::Region}/*"
+              - Sid: WriteStackBuckets
+                Effect: Allow
+                Action: [s3:PutObject, s3:DeleteObject, s3:ListBucket]
+                Resource:
+                  - !GetAtt SpaBucket.Arn
+                  - !Sub "${SpaBucket.Arn}/*"
+                  - !GetAtt AthenaResultsBucket.Arn
+                  - !Sub "${AthenaResultsBucket.Arn}/*"
+              - Sid: Invalidate
+                Effect: Allow
+                Action: cloudfront:CreateInvalidation
+                Resource: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${SpaDistribution}"
+
+  SpaDeployerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-spa-deployer"
+      Runtime: python3.13
+      Handler: index.handler
+      Role: !GetAtt SpaDeployerRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Code:
+        ZipFile: |
+          import json, urllib.request, mimetypes, boto3
+          s3 = boto3.client("s3")
+          cf = boto3.client("cloudfront")
+
+          def respond(event, context, status, reason=""):
+              body = json.dumps({
+                  "Status": status, "Reason": reason or f"See CloudWatch: {context.log_stream_name}",
+                  "PhysicalResourceId": event.get("PhysicalResourceId") or context.log_stream_name,
+                  "StackId": event["StackId"], "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"], "Data": {},
+              }).encode()
+              req = urllib.request.Request(event["ResponseURL"], data=body, method="PUT",
+                                           headers={"content-type": "", "content-length": str(len(body))})
+              urllib.request.urlopen(req)
+
+          def empty(bucket):
+              p = s3.get_paginator("list_objects_v2")
+              for page in p.paginate(Bucket=bucket):
+                  keys = [{"Key": o["Key"]} for o in page.get("Contents", [])]
+                  if keys:
+                      s3.delete_objects(Bucket=bucket, Delete={"Objects": keys})
+
+          def handler(event, context):
+              try:
+                  props = event["ResourceProperties"]
+                  spa = props["SpaBucket"]
+                  if event["RequestType"] == "Delete":
+                      empty(spa)
+                      empty(props["ResultsBucket"])
+                      return respond(event, context, "SUCCESS", "emptied buckets")
+
+                  art, ver, prefix = props["ArtifactBucket"], props["ArtifactVersion"], props["ArtifactVersion"].rstrip("/") + "/frontend/"
+                  paginator = s3.get_paginator("list_objects_v2")
+                  for page in paginator.paginate(Bucket=art, Prefix=prefix):
+                      for obj in page.get("Contents", []):
+                          key = obj["Key"]
+                          if key.endswith("/"):
+                              continue
+                          dest = key[len(prefix):]
+                          ctype = mimetypes.guess_type(dest)[0] or "application/octet-stream"
+                          s3.copy_object(Bucket=spa, Key=dest,
+                                         CopySource={"Bucket": art, "Key": key},
+                                         MetadataDirective="REPLACE", ContentType=ctype)
+                  # Bake the live API endpoint into config.js (overrides any placeholder).
+                  cfg = "window.TRAILWHISPERER_CONFIG = %s;\n" % json.dumps({"apiBase": props["ApiUrl"]})
+                  s3.put_object(Bucket=spa, Key="config.js", Body=cfg.encode(),
+                                ContentType="application/javascript")
+                  try:
+                      cf.create_invalidation(DistributionId=props["DistributionId"],
+                          InvalidationBatch={"Paths": {"Quantity": 1, "Items": ["/*"]},
+                                             "CallerReference": event["RequestId"]})
+                  except Exception as e:
+                      print("invalidation skipped:", e)
+                  respond(event, context, "SUCCESS", "spa published")
+              except Exception as e:
+                  print("ERROR:", e)
+                  respond(event, context, "FAILED", str(e))
+
+  SpaDeployment:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: [SpaBucketPolicy, ApiStage]
+    Properties:
+      ServiceToken: !GetAtt SpaDeployerFunction.Arn
+      ArtifactBucket: !Sub "${ArtifactBucketPrefix}-${AWS::Region}"
+      ArtifactVersion: !Ref ArtifactVersion
+      SpaBucket: !Ref SpaBucket
+      ResultsBucket: !Ref AthenaResultsBucket
+      DistributionId: !Ref SpaDistribution
+      ApiUrl: !GetAtt HttpApi.ApiEndpoint
 
 Outputs:
   UiUrl:

@@ -314,6 +314,9 @@
 
   <div class="toasts" id="toasts" aria-live="assertive"></div>
 
+  <!-- Deploy-time config (API base URL). Overwritten by the stack's SPA deployer;
+       the committed copy is an empty object so local dev falls back to ?api=/localhost. -->
+  <script src="config.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
