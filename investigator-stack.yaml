@@ -1,0 +1,394 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  TrailWhisperer - Serverless, ephemeral natural-language CloudTrail investigator.
+  API Gateway (HTTP API) + Lambda orchestrator + Athena Workgroup + Glue table
+  (partition projection) + Secrets Manager auth token + static SPA on S3/CloudFront.
+
+Parameters:
+  CloudTrailLogBucketName:
+    Type: String
+    Description: Existing S3 bucket that receives CloudTrail management events.
+  VpcFlowLogsBucketName:
+    Type: String
+    Description: Existing S3 bucket that receives VPC Flow Logs (default fields, delivered to S3).
+  GlueDatabaseName:
+    Type: String
+    Default: trailwhisperer_db
+  GlueTableName:
+    Type: String
+    Default: cloudtrail_logs
+  VpcFlowLogsTableName:
+    Type: String
+    Default: vpc_flow_logs
+  BedrockModelId:
+    Type: String
+    Default: anthropic.claude-3-5-sonnet-20241022-v2:0
+    Description: Bedrock model id used for NL->SQL and summarization.
+  BytesScannedCutoff:
+    Type: Number
+    Default: 1073741824
+    Description: Per-query bytes-scanned cap (runaway-cost guard). Default 1 GB.
+  AllowedTimeRangeMaxDays:
+    Type: Number
+    Default: 90
+    Description: Max eventTime window (days) the orchestrator will allow per query.
+
+Resources:
+
+  AthenaResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireResults
+            Status: Enabled
+            ExpirationInDays: 7
+
+  SpaBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  SpaOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-spa-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  SpaDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Origins:
+          - Id: SpaOrigin
+            DomainName: !GetAtt SpaBucket.RegionalDomainName
+            OriginAccessControlId: !Ref SpaOriginAccessControl
+            S3OriginConfig: { OriginAccessIdentity: "" }
+        DefaultCacheBehavior:
+          TargetOriginId: SpaOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+
+  SpaBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SpaBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub "${SpaBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${SpaDistribution}"
+
+  AuthTokenSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}/auth-token"
+      Description: Bearer token the SPA sends to the orchestrator API.
+      GenerateSecretString:
+        SecretStringTemplate: '{}'
+        GenerateStringKey: token
+        PasswordLength: 40
+        ExcludePunctuation: true
+
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref GlueDatabaseName
+
+  GlueTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: !Ref GlueTableName
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: cloudtrail
+          "projection.enabled": "true"
+          "projection.account.type": "enum"
+          "projection.account.values": !Sub "${AWS::AccountId}"
+          "projection.region.type": "enum"
+          "projection.region.values": "us-east-1,us-east-2,us-west-1,us-west-2,eu-west-1,eu-west-2,eu-central-1,eu-north-1,ap-south-1,ap-southeast-1,ap-southeast-2,ap-northeast-1,ap-northeast-2,ca-central-1,sa-east-1"
+          "projection.dt.type": "date"
+          "projection.dt.format": "yyyy/MM/dd"
+          "projection.dt.range": "NOW-3YEARS,NOW"
+          "projection.dt.interval": "1"
+          "projection.dt.interval.unit": "DAYS"
+          "storage.location.template": !Sub "s3://${CloudTrailLogBucketName}/AWSLogs/${!account}/CloudTrail/${!region}/${!dt}"
+        PartitionKeys:
+          - { Name: account, Type: string }
+          - { Name: region, Type: string }
+          - { Name: dt, Type: string }
+        StorageDescriptor:
+          Location: !Sub "s3://${CloudTrailLogBucketName}/AWSLogs/"
+          InputFormat: com.amazon.emr.cloudtrail.CloudTrailInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: com.amazon.emr.hive.serde.CloudTrailSerde
+          Columns:
+            - { Name: eventversion, Type: string }
+            - { Name: useridentity, Type: "struct<type:string,principalid:string,arn:string,accountid:string,invokedby:string,accesskeyid:string,username:string,sessioncontext:struct<attributes:struct<mfaauthenticated:string,creationdate:string>,sessionissuer:struct<type:string,principalid:string,arn:string,accountid:string,username:string>>>" }
+            - { Name: eventtime, Type: string }
+            - { Name: eventsource, Type: string }
+            - { Name: eventname, Type: string }
+            - { Name: awsregion, Type: string }
+            - { Name: sourceipaddress, Type: string }
+            - { Name: useragent, Type: string }
+            - { Name: errorcode, Type: string }
+            - { Name: errormessage, Type: string }
+            - { Name: requestparameters, Type: string }
+            - { Name: responseelements, Type: string }
+            - { Name: additionaleventdata, Type: string }
+            - { Name: requestid, Type: string }
+            - { Name: eventid, Type: string }
+            - { Name: resources, Type: "array<struct<arn:string,accountid:string,type:string>>" }
+            - { Name: eventtype, Type: string }
+            - { Name: apiversion, Type: string }
+            - { Name: readonly, Type: string }
+            - { Name: recipientaccountid, Type: string }
+            - { Name: serviceeventdetails, Type: string }
+            - { Name: sharedeventid, Type: string }
+            - { Name: vpcendpointid, Type: string }
+
+  VpcFlowLogsTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: !Ref VpcFlowLogsTableName
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          # VPC Flow Logs are delivered to S3 as space-delimited text with a header line.
+          "skip.header.line.count": "1"
+          "projection.enabled": "true"
+          "projection.account.type": "enum"
+          "projection.account.values": !Sub "${AWS::AccountId}"
+          "projection.region.type": "enum"
+          "projection.region.values": "us-east-1,us-east-2,us-west-1,us-west-2,eu-west-1,eu-west-2,eu-central-1,eu-north-1,ap-south-1,ap-southeast-1,ap-southeast-2,ap-northeast-1,ap-northeast-2,ca-central-1,sa-east-1"
+          "projection.dt.type": "date"
+          "projection.dt.format": "yyyy/MM/dd"
+          "projection.dt.range": "NOW-3YEARS,NOW"
+          "projection.dt.interval": "1"
+          "projection.dt.interval.unit": "DAYS"
+          "storage.location.template": !Sub "s3://${VpcFlowLogsBucketName}/AWSLogs/${!account}/vpcflowlogs/${!region}/${!dt}"
+        PartitionKeys:
+          - { Name: account, Type: string }
+          - { Name: region, Type: string }
+          - { Name: dt, Type: string }
+        StorageDescriptor:
+          Location: !Sub "s3://${VpcFlowLogsBucketName}/AWSLogs/"
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+            Parameters:
+              "field.delim": " "
+              "serialization.format": " "
+          Columns:
+            - { Name: version, Type: int }
+            - { Name: account_id, Type: string }
+            - { Name: interface_id, Type: string }
+            - { Name: srcaddr, Type: string }
+            - { Name: dstaddr, Type: string }
+            - { Name: srcport, Type: int }
+            - { Name: dstport, Type: int }
+            - { Name: protocol, Type: bigint }
+            - { Name: packets, Type: bigint }
+            - { Name: bytes, Type: bigint }
+            - { Name: start, Type: bigint }
+            - { Name: end, Type: bigint }
+            - { Name: action, Type: string }
+            - { Name: log_status, Type: string }
+
+  InvestigatorWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub "${AWS::StackName}-wg"
+      State: ENABLED
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        BytesScannedCutoffPerQuery: !Ref BytesScannedCutoff
+        PublishCloudWatchMetricsEnabled: true
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${AthenaResultsBucket}/results/"
+
+  OrchestratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: orchestrator
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Bedrock
+                Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}"
+              - Sid: Athena
+                Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                  - athena:StopQueryExecution
+                Resource: !Sub "arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${InvestigatorWorkGroup}"
+              - Sid: Glue
+                Effect: Allow
+                Action:
+                  - glue:GetTable
+                  - glue:GetPartitions
+                  - glue:GetDatabase
+                Resource:
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabaseName}"
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabaseName}/${GlueTableName}"
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabaseName}/${VpcFlowLogsTableName}"
+              - Sid: SourceLogsReadOnly
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${CloudTrailLogBucketName}"
+                  - !Sub "arn:aws:s3:::${CloudTrailLogBucketName}/*"
+                  - !Sub "arn:aws:s3:::${VpcFlowLogsBucketName}"
+                  - !Sub "arn:aws:s3:::${VpcFlowLogsBucketName}/*"
+              - Sid: AthenaResultsReadWrite
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !GetAtt AthenaResultsBucket.Arn
+                  - !Sub "${AthenaResultsBucket.Arn}/*"
+              - Sid: AuthSecret
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref AuthTokenSecret
+
+  OrchestratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-orchestrator"
+      Runtime: python3.13
+      Handler: main.handler
+      Role: !GetAtt OrchestratorRole.Arn
+      Timeout: 60
+      MemorySize: 512
+      Environment:
+        Variables:
+          GLUE_DATABASE: !Ref GlueDatabaseName
+          GLUE_TABLE: !Ref GlueTableName
+          GLUE_VPC_TABLE: !Ref VpcFlowLogsTableName
+          ATHENA_WORKGROUP: !Ref InvestigatorWorkGroup
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          AUTH_SECRET_ARN: !Ref AuthTokenSecret
+          BYTES_SCANNED_CUTOFF: !Ref BytesScannedCutoff
+          ALLOWED_TIME_RANGE_MAX_DAYS: !Ref AllowedTimeRangeMaxDays
+      Code:
+        ZipFile: |
+          import json
+          def handler(event, context):
+              return {
+                  "statusCode": 200,
+                  "headers": {"content-type": "application/json"},
+                  "body": json.dumps({"status": "placeholder - deploy real backend (Phase 3/5)"}),
+              }
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${AWS::StackName}-api"
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins: ["*"]
+        AllowMethods: ["GET", "POST", "OPTIONS"]
+        AllowHeaders: ["authorization", "content-type"]
+
+  ApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt OrchestratorFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  ApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "ANY /{proxy+}"
+      Target: !Sub "integrations/${ApiIntegration}"
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: "$default"
+      AutoDeploy: true
+
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OrchestratorFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*"
+
+Outputs:
+  UiUrl:
+    Value: !Sub "https://${SpaDistribution.DomainName}"
+  ApiUrl:
+    Value: !GetAtt HttpApi.ApiEndpoint
+  SpaBucketName:
+    Value: !Ref SpaBucket
+  AuthSecretArn:
+    Value: !Ref AuthTokenSecret
+  AthenaWorkGroupName:
+    Value: !Ref InvestigatorWorkGroup

@@ -1,0 +1,29 @@
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+    environment:
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      GLUE_DATABASE: ${GLUE_DATABASE:-trailwhisperer_db}
+      GLUE_TABLE: ${GLUE_TABLE:-cloudtrail_logs}
+      GLUE_VPC_TABLE: ${GLUE_VPC_TABLE:-vpc_flow_logs}
+      ATHENA_WORKGROUP: ${ATHENA_WORKGROUP:-primary}
+      BEDROCK_MODEL_ID: ${BEDROCK_MODEL_ID:-anthropic.claude-3-5-sonnet-20241022-v2:0}
+      BYTES_SCANNED_CUTOFF: ${BYTES_SCANNED_CUTOFF:-1073741824}
+      ALLOWED_TIME_RANGE_MAX_DAYS: ${ALLOWED_TIME_RANGE_MAX_DAYS:-90}
+      AUTH_TOKEN: ${AUTH_TOKEN:-local-dev-token}
+    env_file:
+      - .env
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  frontend:
+    image: python:3.13-slim
+    working_dir: /srv
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./frontend:/srv
+    command: python -m http.server 8080

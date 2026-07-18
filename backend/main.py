@@ -1,0 +1,324 @@
+import functools
+import hmac
+import json
+import os
+
+import boto3
+import sqlglot
+from botocore.exceptions import ClientError
+from fastapi import Depends, FastAPI, Header, HTTPException, Path
+from fastapi.middleware.cors import CORSMiddleware
+from mangum import Mangum
+from pydantic import BaseModel, Field
+from sqlglot import exp
+
+REGION = os.getenv("AWS_REGION", "us-east-1")
+MODEL_ID = os.getenv("BEDROCK_MODEL_ID", "anthropic.claude-3-5-sonnet-20241022-v2:0")
+GLUE_DATABASE = os.getenv("GLUE_DATABASE", "trailwhisperer_db")
+GLUE_TABLE = os.getenv("GLUE_TABLE", "cloudtrail_logs")
+GLUE_VPC_TABLE = os.getenv("GLUE_VPC_TABLE", "vpc_flow_logs")
+ATHENA_WORKGROUP = os.getenv("ATHENA_WORKGROUP", "primary")
+# Optional. Deployed workgroups enforce their own OutputLocation, but local dev
+# against the `primary` workgroup has none — set this to write results to S3.
+ATHENA_OUTPUT_LOCATION = os.getenv("ATHENA_OUTPUT_LOCATION")
+MAX_DAYS = int(os.getenv("ALLOWED_TIME_RANGE_MAX_DAYS", "90"))
+MAX_ROWS = 1000
+SUMMARY_ROWS = 200
+
+app = FastAPI(title="TrailWhisperer Orchestrator")
+app.add_middleware(
+    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
+)
+
+
+@functools.lru_cache(maxsize=1)
+def _bedrock():
+    return boto3.client("bedrock-runtime", region_name=REGION)
+
+
+@functools.lru_cache(maxsize=1)
+def _athena():
+    return boto3.client("athena", region_name=REGION)
+
+
+@functools.lru_cache(maxsize=1)
+def auth_token():
+    token = os.getenv("AUTH_TOKEN")
+    if token:
+        return token
+    arn = os.getenv("AUTH_SECRET_ARN")
+    if arn:
+        sm = boto3.client("secretsmanager", region_name=REGION)
+        raw = sm.get_secret_value(SecretId=arn)["SecretString"]
+        try:
+            return json.loads(raw)["token"]
+        except (ValueError, KeyError):
+            return raw
+    return None
+
+
+def require_auth(authorization: str = Header(default="")):
+    expected = auth_token()
+    if not expected:
+        raise HTTPException(500, "auth token not configured")
+    presented = authorization[7:] if authorization.lower().startswith("bearer ") else authorization
+    if not hmac.compare_digest(presented, expected):
+        raise HTTPException(401, "invalid or missing token")
+
+
+# --- Grounding -------------------------------------------------------------
+
+CRIB = (
+    "eventtime: ISO8601 UTC timestamp of the API call. "
+    "eventname/eventsource: the API action and service. "
+    "useridentity: struct(type, arn, username, accountid, sessioncontext...). "
+    "sourceipaddress, useragent: caller origin. "
+    "errorcode/errormessage: set when the call failed/was denied. "
+    "requestparameters/responseelements: JSON strings. "
+    "awsregion, recipientaccountid. "
+    "Partitions: account, region, dt (dt format 'yyyy/MM/dd')."
+)
+
+VPC_CRIB = (
+    "version, account_id, interface_id: flow metadata. "
+    "srcaddr/dstaddr: source/destination IP. srcport/dstport: ports. "
+    "protocol: IANA protocol number (6=TCP, 17=UDP, 1=ICMP). "
+    "packets, bytes: volume transferred. "
+    "start, end: Unix epoch SECONDS of the flow window "
+    "(`end` is a reserved word — always quote it as \"end\"). "
+    "action: 'ACCEPT' or 'REJECT'. log_status: 'OK'/'NODATA'/'SKIPDATA'. "
+    "Partitions: account, region, dt (dt format 'yyyy/MM/dd')."
+)
+
+FEWSHOT = (
+    "Q: Who changed a security group last week?\n"
+    f"SQL: SELECT eventtime, useridentity.arn, eventname, sourceipaddress FROM {GLUE_TABLE} "
+    "WHERE eventname IN ('AuthorizeSecurityGroupIngress','RevokeSecurityGroupIngress','AuthorizeSecurityGroupEgress') "
+    "AND eventtime >= to_iso8601(current_timestamp - interval '7' day) ORDER BY eventtime DESC;\n\n"
+    "Q: Failed console logins in the last 3 days?\n"
+    f"SQL: SELECT eventtime, useridentity.username, sourceipaddress, errormessage FROM {GLUE_TABLE} "
+    "WHERE eventname = 'ConsoleLogin' AND errorcode IS NOT NULL "
+    "AND eventtime >= to_iso8601(current_timestamp - interval '3' day) ORDER BY eventtime DESC;\n\n"
+    "Q: Which hosts had rejected connections on port 22 yesterday?\n"
+    f'SQL: SELECT from_unixtime("start") AS flow_start, srcaddr, dstaddr, dstport, action FROM {GLUE_VPC_TABLE} '
+    "WHERE action = 'REJECT' AND dstport = 22 "
+    "AND \"start\" >= to_unixtime(current_timestamp - interval '1' day) ORDER BY \"start\" DESC;"
+)
+
+SQL_SYSTEM = (
+    "You translate natural-language audit questions into a single Amazon Athena (Trino SQL) query.\n"
+    "Pick exactly ONE whitelisted table for the question:\n"
+    f"- `{GLUE_TABLE}` — AWS API/management activity (who did what) from CloudTrail.\n"
+    f"- `{GLUE_VPC_TABLE}` — network traffic (connections, IPs, ports, accepted/rejected flows) from VPC Flow Logs.\n"
+    "RULES:\n"
+    "- Output ONLY the SQL, no prose, no markdown fences.\n"
+    "- Exactly one read-only SELECT. Never INSERT/UPDATE/DELETE/CREATE/DROP/ALTER/UNLOAD.\n"
+    f"- Query only one of the whitelisted tables (`{GLUE_TABLE}` or `{GLUE_VPC_TABLE}`); never another table or a join across them.\n"
+    "- ALWAYS include a time-window predicate in WHERE. If the user gives no range, "
+    f"default to the last {MAX_DAYS} days and never exceed it:\n"
+    "    * CloudTrail: filter `eventtime` (ISO8601 string) with to_iso8601(current_timestamp - interval 'N' day).\n"
+    "    * VPC Flow Logs: filter \"start\" (Unix epoch seconds, quote the reserved word \"end\" too) "
+    "with to_unixtime(current_timestamp - interval 'N' day).\n"
+    "- Prefer explicit columns, ORDER BY the time column DESC, and add a LIMIT when reasonable.\n\n"
+    f"CLOUDTRAIL (`{GLUE_TABLE}`) COLUMNS:\n{CRIB}\n\n"
+    f"VPC FLOW LOGS (`{GLUE_VPC_TABLE}`) COLUMNS:\n{VPC_CRIB}\n\n"
+    f"EXAMPLES:\n{FEWSHOT}"
+)
+
+SUMMARY_SYSTEM = (
+    "You are a cloud security analyst. Summarize ONLY the log rows provided (JSON; "
+    "CloudTrail API activity or VPC Flow Logs network traffic). "
+    "Do not invent data not present in the rows. Return STRICT JSON: "
+    '{"summary": "<2-4 sentence narrative answering the question>", '
+    '"flags": ["<notable/anomalous observation>", ...]}. '
+    "Flags are heuristic: repeated failures, unusual principals/IPs, privilege changes, "
+    "sensitive API calls, off-hours activity. Empty list if nothing stands out."
+)
+
+
+class GenerateRequest(BaseModel):
+    question: str = Field(min_length=3, max_length=2000)
+    model_id: str | None = None
+
+
+class ExecuteRequest(BaseModel):
+    sql: str = Field(min_length=8)
+
+
+def _invoke(system: str, user: str, max_tokens: int = 1024, model_id: str | None = None) -> str:
+    # Converse gives a single schema across all Bedrock chat models
+    # (Claude, Amazon Nova, Qwen, Llama, Mistral, DeepSeek, ...), so the same
+    # code works whichever model the user selects.
+    try:
+        resp = _bedrock().converse(
+            modelId=model_id or MODEL_ID,
+            system=[{"text": system}],
+            messages=[{"role": "user", "content": [{"text": user}]}],
+            inferenceConfig={"maxTokens": max_tokens, "temperature": 0},
+        )
+    except ClientError as e:
+        raise HTTPException(502, f"bedrock error: {e.response['Error'].get('Message', str(e))}")
+    blocks = resp["output"]["message"]["content"]
+    # Reasoning models (Qwen thinking, DeepSeek-R1) emit a reasoning block first,
+    # then the answer — take the first text block.
+    return next((b["text"] for b in blocks if "text" in b), "").strip()
+
+
+def _clean_sql(text: str) -> str:
+    t = text.strip()
+    if t.startswith("```"):
+        t = t.split("```", 2)[1] if "```" in t[3:] else t[3:]
+        if t.lower().startswith("sql"):
+            t = t[3:]
+    return t.strip().rstrip(";").strip()
+
+
+def validate_sql(sql: str):
+    """Parse-based guardrail. Returns (ok, reason)."""
+    try:
+        statements = [s for s in sqlglot.parse(sql, dialect="trino") if s]
+    except Exception as e:
+        return False, f"could not parse SQL: {e}"
+    if len(statements) != 1:
+        return False, "exactly one statement is allowed"
+    stmt = statements[0]
+    forbidden = (
+        exp.Insert, exp.Update, exp.Delete, exp.Create, exp.Drop,
+        exp.Alter, exp.Merge, exp.Command,
+    )
+    if any(stmt.find(f) for f in forbidden):
+        return False, "only read-only SELECT statements are allowed"
+    if not isinstance(stmt, (exp.Select, exp.Union)):
+        return False, "query must be a SELECT"
+    allowed = {GLUE_TABLE.lower(), GLUE_VPC_TABLE.lower()}
+    tables = {t.name.lower() for t in stmt.find_all(exp.Table) if t.name}
+    if tables - allowed:
+        return False, f"only tables `{GLUE_TABLE}` or `{GLUE_VPC_TABLE}` may be queried"
+    wheres = list(stmt.find_all(exp.Where))
+    if not wheres:
+        return False, "a time-window filter is required"
+    cols = {c.name.lower() for w in wheres for c in w.find_all(exp.Column)}
+    # CloudTrail uses eventtime/dt; VPC Flow Logs use start/end (dt partition shared).
+    if not ({"eventtime", "dt", "start", "end"} & cols):
+        return False, "WHERE must constrain a time window (eventtime/dt for CloudTrail, start/end for VPC flow logs)"
+    return True, None
+
+
+@app.get("/api/health")
+def health():
+    return {
+        "status": "ok",
+        "model": MODEL_ID,
+        "tables": [f"{GLUE_DATABASE}.{GLUE_TABLE}", f"{GLUE_DATABASE}.{GLUE_VPC_TABLE}"],
+    }
+
+
+@app.post("/api/generate-sql", dependencies=[Depends(require_auth)])
+def generate_sql(req: GenerateRequest):
+    sql = _clean_sql(_invoke(SQL_SYSTEM, req.question, model_id=req.model_id))
+    ok, reason = validate_sql(sql)
+    if not ok:
+        # one self-correction round
+        sql = _clean_sql(
+            _invoke(SQL_SYSTEM, f"{req.question}\n\nYour previous SQL was rejected: {reason}\nSQL was:\n{sql}\nFix it.", model_id=req.model_id)
+        )
+        ok, reason = validate_sql(sql)
+    if not ok:
+        raise HTTPException(422, f"could not produce a safe query: {reason}")
+    return {"sql": sql}
+
+
+@app.post("/api/execute-sql", dependencies=[Depends(require_auth)])
+def execute_sql(req: ExecuteRequest):
+    sql = req.sql.strip().rstrip(";").strip()
+    ok, reason = validate_sql(sql)
+    if not ok:
+        raise HTTPException(422, f"rejected by guardrail: {reason}")
+    params = {
+        "QueryString": sql,
+        "QueryExecutionContext": {"Database": GLUE_DATABASE},
+        "WorkGroup": ATHENA_WORKGROUP,
+    }
+    if ATHENA_OUTPUT_LOCATION:
+        params["ResultConfiguration"] = {"OutputLocation": ATHENA_OUTPUT_LOCATION}
+    try:
+        resp = _athena().start_query_execution(**params)
+    except ClientError as e:
+        raise HTTPException(502, f"athena error: {e.response['Error'].get('Message', str(e))}")
+    return {"execution_id": resp["QueryExecutionId"]}
+
+
+def _fetch_rows(execution_id: str):
+    paginator = _athena().get_paginator("get_query_results")
+    header = None
+    rows = []
+    for page in paginator.paginate(
+        QueryExecutionId=execution_id, PaginationConfig={"MaxItems": MAX_ROWS + 1}
+    ):
+        for r in page["ResultSet"]["Rows"]:
+            values = [c.get("VarCharValue") for c in r["Data"]]
+            if header is None:
+                header = values
+            else:
+                rows.append(dict(zip(header, values)))
+    return header or [], rows
+
+
+def _parse_summary_json(text: str):
+    """Extract the {summary, flags} object even if the model wraps it in
+    markdown fences or surrounding prose. Returns dict or None."""
+    try:
+        return json.loads(text)
+    except ValueError:
+        pass
+    # Fall back to the outermost {...} span (handles ```json fences / prose).
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end > start:
+        try:
+            return json.loads(text[start:end + 1])
+        except ValueError:
+            return None
+    return None
+
+
+def _summarize(question: str, rows: list, model_id: str | None = None):
+    sample = rows[:SUMMARY_ROWS]
+    user = f"Question: {question or 'Summarize this CloudTrail activity.'}\n\nRows (JSON):\n{json.dumps(sample, default=str)}"
+    text = _invoke(SUMMARY_SYSTEM, user, max_tokens=800, model_id=model_id)
+    data = _parse_summary_json(text)
+    if isinstance(data, dict):
+        return data.get("summary", ""), data.get("flags", [])
+    return text, []
+
+
+@app.get("/api/results/{execution_id}", dependencies=[Depends(require_auth)])
+def get_results(execution_id: str = Path(min_length=8), question: str = "", model_id: str = ""):
+    try:
+        info = _athena().get_query_execution(QueryExecutionId=execution_id)["QueryExecution"]
+    except ClientError as e:
+        raise HTTPException(502, f"athena error: {e.response['Error'].get('Message', str(e))}")
+
+    state = info["Status"]["State"]
+    scanned = info.get("Statistics", {}).get("DataScannedInBytes")
+
+    if state in ("QUEUED", "RUNNING"):
+        return {"status": "running", "state": state}
+    if state in ("FAILED", "CANCELLED"):
+        reason = info["Status"].get("StateChangeReason", "query did not succeed")
+        return {"status": "failed", "state": state, "error": reason, "bytes_scanned": scanned}
+
+    columns, rows = _fetch_rows(execution_id)
+    summary, flags = _summarize(question, rows, model_id or None) if rows else ("No matching events were found.", [])
+    return {
+        "status": "succeeded",
+        "columns": columns,
+        "rows": rows,
+        "row_count": len(rows),
+        "truncated": len(rows) >= MAX_ROWS,
+        "bytes_scanned": scanned,
+        "summary": summary,
+        "flags": flags,
+    }
+
+
+handler = Mangum(app)

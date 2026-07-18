@@ -1,0 +1,38 @@
+# --- Secrets & local config (never commit) ---
+.env
+.env.*
+!.env.example
+
+# --- Agent coordination / planning docs (local only) ---
+CLAUDE.md
+AGENT_CONTEXT.md
+roadmap.md
+cloudtrail-nl-investigator-tasarim.md
+.agents/
+
+# --- Claude Code local settings ---
+.claude/settings.local.json
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- OS / editor cruft ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# --- Build / deploy artifacts ---
+dist/
+build/
+*.zip
+packaged.yaml

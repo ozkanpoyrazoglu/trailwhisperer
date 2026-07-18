@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TrailWhisperer — Natural-language CloudTrail investigator</title>
+  <meta name="color-scheme" content="dark" />
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,500;1,9..144,400&family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap"
+    rel="stylesheet" />
+
+  <!-- Tailwind CDN: utility layer for layout; the design system lives in style.css -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="ambient" aria-hidden="true"></div>
+
+  <div id="app">
+    <!-- Top bar --------------------------------------------------------- -->
+    <header class="topbar">
+      <div class="brand">
+        <span class="sigil" aria-hidden="true">
+          <!-- waveform / signal trace -->
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M2 12h3l2-7 3 15 3-11 2 5h7" />
+          </svg>
+        </span>
+        <div>
+          <h1>TrailWhisperer</h1>
+          <span class="kicker">CloudTrail · Natural-language audit</span>
+        </div>
+      </div>
+
+      <span class="health" id="health" data-state="unknown" title="Backend status">
+        <span class="dot"></span><span class="label">connecting…</span>
+      </span>
+
+      <div class="model-picker" id="modelPicker">
+        <label class="sr-only" for="modelSelect">Bedrock model</label>
+        <select id="modelSelect" title="Bedrock model used for generation & summary">
+          <optgroup label="Anthropic Claude">
+            <option value="anthropic.claude-3-5-sonnet-20241022-v2:0">Claude 3.5 Sonnet v2</option>
+            <option value="anthropic.claude-3-5-haiku-20241022-v1:0">Claude 3.5 Haiku</option>
+            <option value="anthropic.claude-3-opus-20240229-v1:0">Claude 3 Opus</option>
+            <option value="anthropic.claude-3-haiku-20240307-v1:0">Claude 3 Haiku</option>
+          </optgroup>
+          <optgroup label="Amazon Nova">
+            <option value="us.amazon.nova-micro-v1:0">Nova Micro</option>
+            <option value="us.amazon.nova-lite-v1:0">Nova Lite</option>
+            <option value="us.amazon.nova-pro-v1:0">Nova Pro</option>
+          </optgroup>
+          <optgroup label="Qwen">
+            <option value="qwen.qwen3-32b-v1:0">Qwen3 32B</option>
+            <option value="qwen.qwen3-coder-30b-a3b-v1:0">Qwen3 Coder 30B</option>
+            <option value="qwen.qwen3-235b-a22b-2507-v1:0">Qwen3 235B</option>
+          </optgroup>
+          <optgroup label="Meta Llama">
+            <option value="us.meta.llama3-3-70b-instruct-v1:0">Llama 3.3 70B</option>
+            <option value="us.meta.llama3-1-8b-instruct-v1:0">Llama 3.1 8B</option>
+          </optgroup>
+          <optgroup label="Mistral">
+            <option value="mistral.mistral-large-2407-v1:0">Mistral Large</option>
+          </optgroup>
+          <optgroup label="DeepSeek">
+            <option value="us.deepseek.r1-v1:0">DeepSeek-R1</option>
+          </optgroup>
+          <option value="__custom__">Custom model ID…</option>
+        </select>
+        <svg class="chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="m6 9 6 6 6-6" />
+        </svg>
+        <button type="button" id="customBack" class="icon-btn custom-back" title="Back to model list" aria-label="Back to model list" hidden>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="m15 6-6 6 6 6" />
+          </svg>
+        </button>
+        <input id="customModel" class="custom-model" type="text" placeholder="e.g. us.amazon.nova-pro-v1:0" autocomplete="off" spellcheck="false" hidden />
+      </div>
+
+      <button class="icon-btn badge-btn" id="caseLogBtn" title="Case log" aria-label="Open case log">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 6h16M4 12h16M4 18h10" />
+        </svg>
+        <span class="badge-count" id="caseCount" data-empty="true">0</span>
+      </button>
+
+      <button class="icon-btn" id="keyBtn" title="Access token" aria-label="Manage access token">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="7.5" cy="15.5" r="4.5" /><path d="m10.7 12.3 9.3-9.3M17 5l3 3M15 7l2 2" />
+        </svg>
+      </button>
+    </header>
+
+    <!-- Thread ---------------------------------------------------------- -->
+    <main class="thread" id="thread" aria-live="polite">
+      <section class="hero" id="hero">
+        <p class="eyebrow">Read-only · human-approved · ephemeral</p>
+        <h2>Ask your audit trail<br /><em>anything.</em></h2>
+        <p>
+          Describe what you're investigating in plain language. TrailWhisperer drafts the
+          Athena SQL, shows it to you for approval, then narrates exactly what the logs say —
+          nothing they don't.
+        </p>
+        <div class="chips" id="chips">
+          <button class="chip">Who changed a security group last week?</button>
+          <button class="chip">Failed console logins in the last 3 days</button>
+          <button class="chip">IAM policy changes in the past 24 hours</button>
+          <button class="chip">Root account activity this month</button>
+          <button class="chip">Rejected SSH connections to internal hosts yesterday</button>
+        </div>
+      </section>
+    </main>
+
+    <!-- Composer -------------------------------------------------------- -->
+    <div class="composer-wrap">
+      <form class="composer glass" id="composer">
+        <label class="sr-only" for="question">Ask about your CloudTrail logs</label>
+        <textarea id="question" rows="1" placeholder="Ask about your CloudTrail or VPC flow logs…" autocomplete="off"></textarea>
+        <button type="submit" class="btn btn-primary" id="askBtn">
+          <span>Investigate</span>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M5 12h14M13 6l6 6-6 6" />
+          </svg>
+        </button>
+      </form>
+      <div class="composer-hint">
+        <span>Every query is shown for approval before it touches your logs.</span>
+        <span><kbd>Enter</kbd> to send · <kbd>Shift</kbd>+<kbd>Enter</kbd> newline</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Auth modal -------------------------------------------------------- -->
+  <div class="scrim" id="authScrim" hidden role="dialog" aria-modal="true" aria-labelledby="authTitle">
+    <div class="modal">
+      <div class="modal-head">
+        <span class="modal-seal cool">
+          <span class="badge">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="4" y="10" width="16" height="11" rx="2" /><path d="M8 10V7a4 4 0 0 1 8 0v3" />
+            </svg>
+          </span>
+          Access required
+        </span>
+        <h3 id="authTitle">Enter your access token</h3>
+        <p class="sub">
+          TrailWhisperer authenticates with the bearer token generated at deploy time and stored
+          in AWS Secrets Manager. It's kept only in this browser and sent on every request.
+        </p>
+      </div>
+      <div class="modal-body">
+        <form id="authForm">
+          <div class="field">
+            <input id="tokenInput" type="password" placeholder="tw_••••••••••••••••••••••••" autocomplete="off" spellcheck="false" />
+            <button type="button" class="reveal" id="revealToken" aria-label="Show token">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z" /><circle cx="12" cy="12" r="3" />
+              </svg>
+            </button>
+          </div>
+          <p class="field-note" id="authNote">Find it in Secrets Manager under the secret this stack created.</p>
+        </form>
+      </div>
+      <div class="modal-foot">
+        <span class="spacer"></span>
+        <button class="btn btn-primary" id="saveToken">Save token</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- SQL approval "warrant" modal -------------------------------------- -->
+  <div class="scrim" id="sqlScrim" hidden role="dialog" aria-modal="true" aria-labelledby="sqlTitle">
+    <div class="modal wide">
+      <div class="modal-head">
+        <span class="modal-seal">
+          <span class="badge">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M9 12l2 2 4-4" /><path d="M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6l7-3Z" />
+            </svg>
+          </span>
+          Authorization required
+        </span>
+        <h3 id="sqlTitle">Review the generated query</h3>
+        <p class="sub">Nothing runs until you approve it. Edit the SQL if you want — it's re-validated before execution.</p>
+      </div>
+      <div class="modal-body">
+        <div class="warrant-meta" id="warrantMeta"></div>
+        <textarea class="sql-box" id="sqlBox" spellcheck="false"></textarea>
+        <div class="warrant-scope">
+          <span>Scan scope</span>
+          <span class="scope-meter"><i></i></span>
+          <span id="scopeText">bounded by workgroup cutoff</span>
+        </div>
+        <div class="warrant-note">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z" />
+          </svg>
+          <span>Read-only <b>SELECT</b> on the CloudTrail table with a mandatory time-window filter. Approving runs it once on Athena.</span>
+        </div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn btn-ghost" id="cancelSql">Cancel</button>
+        <span class="spacer"></span>
+        <button class="btn btn-amber" id="approveSql">
+          Approve &amp; run
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Case log drawer -------------------------------------------------- -->
+  <div class="drawer-wrap" id="caseWrap" hidden>
+    <div class="drawer-scrim" data-close></div>
+    <aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="caseTitle">
+      <div class="drawer-head">
+        <div>
+          <h3 id="caseTitle">Case log</h3>
+          <span class="sub">This session</span>
+        </div>
+        <button class="icon-btn" id="closeCase" title="Close" aria-label="Close case log">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M6 6l12 12M18 6 6 18" />
+          </svg>
+        </button>
+      </div>
+      <div class="drawer-list" id="caseList" hidden></div>
+      <div class="drawer-empty" id="caseEmpty">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 6h16M4 12h16M4 18h10" />
+        </svg>
+        <p>No cases yet. Ask a question to open your first investigation.</p>
+      </div>
+      <div class="drawer-foot">
+        <button class="btn btn-ghost" id="clearCase">Clear log</button>
+      </div>
+    </aside>
+  </div>
+
+  <div class="toasts" id="toasts" aria-live="assertive"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
