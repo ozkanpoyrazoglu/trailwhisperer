@@ -197,6 +197,76 @@ def _clean_sql(text: str) -> str:
     return t.strip().rstrip(";").strip()
 
 
+# --- Guardrail helpers -----------------------------------------------------
+# A `dt` predicate that actually prunes partitions must narrow the scan: a lower
+# bound (>=/>), an exact match (=/IN), or a range (BETWEEN). Upper-bound-only
+# (</<=), IS [NOT] NULL, LIKE and <> do NOT bound how far back Athena scans, so
+# they don't count as binding.
+_DT_BINDING = (exp.GTE, exp.GT, exp.EQ, exp.Between, exp.In)
+_UNIT_DAYS = {
+    "day": 1, "days": 1, "week": 7, "weeks": 7,
+    "month": 30, "months": 30, "year": 365, "years": 365,
+}
+
+
+def _own_tables(select: exp.Select) -> set[str]:
+    """Whitelisted table names in THIS select's own FROM/joins (not nested
+    subqueries — those belong to their own inner select)."""
+    return {
+        t.name.lower()
+        for t in select.find_all(exp.Table)
+        if t.name and t.find_ancestor(exp.Select) is select
+    }
+
+
+def _under_or(node: exp.Expression, where: exp.Where) -> bool:
+    """True if `node` sits under an OR anywhere between it and its WHERE — such a
+    predicate can't be relied on to prune (Athena won't prune across an OR)."""
+    p = node.parent
+    while p is not None and p is not where:
+        if isinstance(p, exp.Or):
+            return True
+        p = p.parent
+    return False
+
+
+def _has_binding_dt(select: exp.Select) -> bool:
+    """True if this select's own WHERE contains a binding `dt` predicate in AND
+    context (not under OR, not only inside a nested subquery)."""
+    where = select.args.get("where")
+    if not where:
+        return False
+    for cmp in where.find_all(*_DT_BINDING):
+        # the comparison must belong to THIS select's WHERE, not a nested subquery
+        if cmp.find_ancestor(exp.Select) is not select:
+            continue
+        if _under_or(cmp, where):
+            continue
+        # the `dt` operand must itself belong to this select (guards against a
+        # dt filter that lives only inside a subquery on the RHS, e.g. IN (...))
+        if any(c.name.lower() == "dt" and c.find_ancestor(exp.Select) is select
+               for c in cmp.find_all(exp.Column)):
+            return True
+    return False
+
+
+def _window_within_cap(stmt: exp.Expression) -> bool:
+    """Reject `interval 'N' <unit>` windows longer than MAX_DAYS."""
+    for iv in stmt.find_all(exp.Interval):
+        unit_node = iv.args.get("unit")
+        unit = (unit_node.name.lower() if unit_node else "")
+        factor = _UNIT_DAYS.get(unit)
+        if factor is None:  # sub-day units (hour/minute/...) never exceed the cap
+            continue
+        try:
+            n = int(iv.this.name)
+        except (AttributeError, ValueError):
+            continue
+        if n * factor > MAX_DAYS:
+            return False
+    return True
+
+
 def validate_sql(sql: str):
     """Parse-based guardrail. Returns (ok, reason)."""
     try:
@@ -221,14 +291,29 @@ def validate_sql(sql: str):
     wheres = list(stmt.find_all(exp.Where))
     if not wheres:
         return False, "a time-window filter is required"
-    cols = {c.name.lower() for w in wheres for c in w.find_all(exp.Column)}
-    # Partition pruning is non-negotiable: `dt` (the yyyy/MM/dd partition key, shared by
-    # both tables) MUST be in the WHERE clause so Athena scans only the needed partitions.
-    if "dt" not in cols:
-        return False, (
-            "WHERE must filter the `dt` partition key for partition pruning, e.g. "
-            "dt >= date_format(current_timestamp - interval 'N' day, '%Y/%m/%d')"
-        )
+
+    # Partition pruning is non-negotiable: EVERY select that scans a whitelisted
+    # table must itself bind the `dt` partition key (yyyy/MM/dd, shared by both
+    # tables). Checking mere presence of the column name is not enough — it lets
+    # OR branches, non-range predicates (IS NOT NULL/LIKE), subquery-only filters
+    # and unpruned UNION branches through. We require a binding predicate in the
+    # AND context of each scanning select's own WHERE.
+    scanning = [s for s in stmt.find_all(exp.Select) if _own_tables(s) & allowed]
+    if not scanning:
+        return False, "query must scan a whitelisted table"
+    for s in scanning:
+        if not _has_binding_dt(s):
+            return False, (
+                "WHERE must bind the `dt` partition key with a range/equality filter "
+                "in AND context (not under OR, not only in a subquery), e.g. "
+                "dt >= date_format(current_timestamp - interval 'N' day, '%Y/%m/%d')"
+            )
+
+    # Enforce the configured maximum time window (partition pruning alone doesn't
+    # cap how far back the window reaches).
+    if not _window_within_cap(stmt):
+        return False, f"time window exceeds the {MAX_DAYS}-day maximum"
+
     return True, None
 
 
