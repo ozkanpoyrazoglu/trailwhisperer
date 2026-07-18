@@ -170,7 +170,12 @@ SQL_SYSTEM = (
     "    * CloudTrail: filter `eventtime` (ISO8601 string) with to_iso8601(current_timestamp - interval 'N' day).\n"
     "    * VPC Flow Logs: filter \"start\" (Unix epoch seconds, quote the reserved word \"end\" too) "
     "with to_unixtime(current_timestamp - interval 'N' day).\n"
-    "- Prefer explicit columns, ORDER BY the time column DESC, and add a LIMIT when reasonable.\n\n"
+    "- Prefer explicit columns, ORDER BY the time column DESC, and add a LIMIT when reasonable.\n"
+    "- QUOTING (critical): delimit EVERY string literal with SINGLE quotes only. NEVER use a double "
+    "quote to open or close a literal. When matching JSON in `requestparameters`, the double-quote "
+    "characters are part of the JSON payload and belong INSIDE a single-quoted pattern — the pattern "
+    "must both open and close with a single quote, e.g. requestparameters LIKE '%\"groupId\":%'. A "
+    "pattern like '%\"groupId\":%\" is malformed and will be rejected.\n\n"
     f"CLOUDTRAIL (`{GLUE_TABLE}`) COLUMNS:\n{CRIB}\n\n"
     f"VPC FLOW LOGS (`{GLUE_VPC_TABLE}`) COLUMNS:\n{VPC_CRIB}\n\n"
     f"EXAMPLES:\n{FEWSHOT}"
@@ -366,8 +371,12 @@ def health():
 def generate_sql(req: GenerateRequest):
     sql = _clean_sql(_invoke(SQL_SYSTEM, req.question, model_id=req.model_id))
     ok, reason = validate_sql(sql)
-    if not ok:
-        # one self-correction round
+    # Up to two self-correction rounds: feed the rejection reason + bad SQL back to
+    # the model. Smaller models (e.g. Nova) often mangle string-literal quoting and
+    # need more than one shot to recover.
+    for _ in range(2):
+        if ok:
+            break
         sql = _clean_sql(
             _invoke(SQL_SYSTEM, f"{req.question}\n\nYour previous SQL was rejected: {reason}\nSQL was:\n{sql}\nFix it.", model_id=req.model_id)
         )

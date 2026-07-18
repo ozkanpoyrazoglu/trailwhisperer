@@ -278,7 +278,14 @@ Resources:
               - Sid: Bedrock
                 Effect: Allow
                 Action: bedrock:InvokeModel
-                Resource: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}"
+                # BedrockModelId may be a cross-region inference profile (e.g. us.amazon.nova-pro-v1:0).
+                # Invoking a profile requires permission on BOTH the inference-profile ARN and the
+                # underlying foundation-model ARNs in every region the profile can route to. We grant
+                # the profile in this account/region and the foundation model across all regions.
+                Resource:
+                  - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}"
+                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${BedrockModelId}"
+                  - !Sub "arn:aws:bedrock:*::foundation-model/*"
               - Sid: Athena
                 Effect: Allow
                 Action:
