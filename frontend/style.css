@@ -58,9 +58,13 @@ body {
 /* Full-width viewport: fixed sidebar + fluid main column. */
 #app {
   display: grid;
+  /* Right sidebar collapsed by default — revealed via the .help-open modifier. */
   grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
   height: 100dvh;
   width: 100%;
+}
+#app.help-open {
+  grid-template-columns: var(--sidebar-w) minmax(0, 1fr) var(--sidebar-w);
 }
 
 /* =========================== SIDEBAR ====================================== */
@@ -874,8 +878,110 @@ tbody tr[data-sev="critical"] td { background: rgba(248, 113, 113, 0.06); }
 /* ---------------------------- Responsive ----------------------------------- */
 /* Below the sidebar breakpoint, collapse to a single column and let the
    sidebar sit above the thread (still functional, just stacked). */
+/* =========================== RIGHT SIDEBAR ================================ */
+/* "What can you ask?" — mirrors the left sidebar's slate design tokens.
+   Collapsed by default; shown only when #app has .help-open. */
+.right-sidebar {
+  display: none;
+  background: var(--sidebar);
+  border-left: 1px solid var(--line);
+  padding: 20px 18px;
+  overflow-y: auto;
+  flex-direction: column;
+  gap: 22px;
+  min-height: 0;
+}
+#app.help-open .right-sidebar { display: flex; }
+.right-head { display: flex; flex-direction: column; gap: 6px; }
+.right-head-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.right-sub { margin: 0; font-size: 12px; line-height: 1.45; color: var(--faint); }
+
+/* Floating toggle — visible only while the panel is collapsed. */
+.help-toggle {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  z-index: 20;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--muted);
+  padding: 8px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--line-strong);
+  background: var(--panel);
+  cursor: pointer;
+  box-shadow: var(--shadow);
+  transition: color 0.15s var(--ease), border-color 0.15s var(--ease), background 0.15s var(--ease);
+}
+.help-toggle svg { width: 16px; height: 16px; }
+.help-toggle:hover { color: var(--text); border-color: var(--signal); background: var(--signal-dim); }
+.help-toggle:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
+#app.help-open .help-toggle { display: none; }
+
+.sample-group { display: flex; flex-direction: column; gap: 8px; }
+.sample-group-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 2px;
+}
+.sample-group-title {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+.sample-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+}
+.sample-dot.ct { background: var(--signal); box-shadow: 0 0 0 3px var(--signal-dim); }
+.sample-dot.vpc { background: var(--signal-2); box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.12); }
+
+.sample-q {
+  text-align: left;
+  font: inherit;
+  font-size: 12.5px;
+  line-height: 1.4;
+  color: var(--muted);
+  padding: 9px 11px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line);
+  background: var(--panel);
+  cursor: pointer;
+  transition: color 0.15s var(--ease), border-color 0.15s var(--ease), background 0.15s var(--ease);
+}
+.sample-q:hover { color: var(--text); border-color: var(--signal); background: var(--signal-dim); }
+.sample-q:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
+
+.right-sidebar::-webkit-scrollbar { width: 10px; }
+.right-sidebar::-webkit-scrollbar-thumb { background: var(--line-strong); border-radius: 99px; border: 2px solid transparent; background-clip: content-box; }
+
+/* Not enough room for a 3rd grid column on medium screens — when open, the
+   panel slides in as a fixed overlay instead of squeezing the main column. */
+@media (max-width: 1100px) {
+  #app.help-open { grid-template-columns: var(--sidebar-w) minmax(0, 1fr); }
+  #app.help-open .right-sidebar {
+    position: fixed;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: min(320px, 86vw);
+    z-index: 30;
+    box-shadow: var(--shadow);
+  }
+}
+
 @media (max-width: 860px) {
-  #app { grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr); }
+  #app, #app.help-open { grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr); }
+  /* Toggle would overlap the collapsed top bar — the overlay's own × still closes it. */
+  .help-toggle { display: none; }
   .sidebar {
     grid-template-rows: auto;
     grid-template-columns: 1fr;

@@ -159,6 +159,53 @@
         </div>
       </div>
     </div>
+
+    <!-- Right sidebar: "What can you ask?" sample queries ----------------- -->
+    <aside class="right-sidebar" id="rightSidebar" aria-label="Example questions">
+      <div class="right-head">
+        <div class="right-head-top">
+          <span class="control-label">What can you ask?</span>
+          <button type="button" class="icon-btn" id="helpClose" title="Hide examples" aria-label="Hide examples">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M18 6 6 18M6 6l12 12" />
+            </svg>
+          </button>
+        </div>
+        <p class="right-sub">Click a prompt to drop it into the composer.</p>
+      </div>
+
+      <div class="sample-group">
+        <div class="sample-group-head">
+          <span class="sample-dot ct" aria-hidden="true"></span>
+          <span class="sample-group-title">CloudTrail — API activity</span>
+        </div>
+        <button class="sample-q">Who changed a security group last week?</button>
+        <button class="sample-q">Failed console logins in the last 3 days</button>
+        <button class="sample-q">IAM policy changes in the past 24 hours</button>
+        <button class="sample-q">Root account activity this month</button>
+        <button class="sample-q">S3 buckets made public in the last 7 days</button>
+        <button class="sample-q">Access-denied errors by principal this week</button>
+      </div>
+
+      <div class="sample-group">
+        <div class="sample-group-head">
+          <span class="sample-dot vpc" aria-hidden="true"></span>
+          <span class="sample-group-title">VPC Flow Logs — network traffic</span>
+        </div>
+        <button class="sample-q">Rejected SSH connections to internal hosts yesterday</button>
+        <button class="sample-q">Top talkers by bytes transferred in the last 24 hours</button>
+        <button class="sample-q">Rejected connections on port 3389 this week</button>
+        <button class="sample-q">Outbound traffic to unusual ports in the past 3 days</button>
+      </div>
+    </aside>
+
+    <!-- Floating toggle to reveal the "What can you ask?" panel ---------- -->
+    <button type="button" class="help-toggle" id="helpToggle" title="Query library" aria-label="Show query library" aria-expanded="false" aria-controls="rightSidebar">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" /><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2Z" />
+      </svg>
+      <span>Library</span>
+    </button>
   </div>
 
   <!-- Auth modal -------------------------------------------------------- -->

@@ -10,6 +10,7 @@ const AUTO_KEY = "trailwhisperer.autorun";
 const AUTO_SECONDS = 5;
 const MODEL_KEY = "trailwhisperer.model";
 const CUSTOM_MODEL_KEY = "trailwhisperer.model.custom";
+const HELP_KEY = "trailwhisperer.helppanel";
 const CUSTOM = "__custom__";
 const POLL_MS = 1300;
 const POLL_MAX = 90; // ~2 min ceiling
@@ -28,6 +29,7 @@ const el = {
   autoRun: $("autoRun"), sqlCountdown: $("sqlCountdown"), countNum: $("countNum"), pauseAuto: $("pauseAuto"),
   toasts: $("toasts"),
   caseCount: $("caseCount"), caseList: $("caseList"), caseEmpty: $("caseEmpty"), clearCase: $("clearCase"),
+  app: $("app"), helpToggle: $("helpToggle"), helpClose: $("helpClose"),
 };
 
 let token = localStorage.getItem(TOKEN_KEY) || "";
@@ -460,7 +462,8 @@ el.question.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); el.composer.requestSubmit(); }
 });
 
-document.querySelectorAll(".chip").forEach((c) =>
+// Hero chips + right-sidebar "What can you ask?" prompts both fill the composer.
+document.querySelectorAll(".chip, .sample-q").forEach((c) =>
   c.addEventListener("click", () => { el.question.value = c.textContent; autoGrow(); el.question.focus(); })
 );
 
@@ -492,6 +495,15 @@ el.caseList.addEventListener("keydown", (e) => {
   if (rerun) { const h = history.find((x) => x.id === rerun.dataset.rerun); if (h) rerunCase(h.question); }
   else jumpToCase(item.dataset.id);
 });
+
+// "What can you ask?" panel: collapsed by default, toggled + persisted.
+function setHelp(open) {
+  el.app.classList.toggle("help-open", open);
+  el.helpToggle.setAttribute("aria-expanded", open ? "true" : "false");
+  localStorage.setItem(HELP_KEY, open ? "1" : "0");
+}
+el.helpToggle.addEventListener("click", () => setHelp(true));
+el.helpClose.addEventListener("click", () => setHelp(false));
 
 el.keyBtn.addEventListener("click", () => openAuth());
 el.saveToken.addEventListener("click", saveToken);
@@ -525,6 +537,7 @@ document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
   if (!el.sqlScrim.hidden) { closeSql(); addNote("Query cancelled — nothing was run."); }
   else if (!el.authScrim.hidden && token) closeAuth();
+  else if (el.app.classList.contains("help-open")) setHelp(false);
 });
 
 /* ------------------------------- boot ----------------------------------- */
@@ -535,6 +548,7 @@ if (el.modelSelect.value === CUSTOM) setCustomMode(true);
 else lastRealModel = el.modelSelect.value;
 
 el.autoRun.checked = localStorage.getItem(AUTO_KEY) === "1";
+setHelp(localStorage.getItem(HELP_KEY) === "1"); // default: collapsed
 
 if (token) el.keyBtn.dataset.set = "true";
 else openAuth();
