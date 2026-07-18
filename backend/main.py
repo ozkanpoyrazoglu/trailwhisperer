@@ -135,6 +135,15 @@ SUMMARY_SYSTEM = (
     "sensitive API calls, off-hours activity. Empty list if nothing stands out."
 )
 
+# Plain-language rendering of the generated SQL, so a non-technical approver can
+# understand what they are authorizing before it runs (human-in-the-loop).
+EXPLAIN_SYSTEM = (
+    "You explain an Athena SQL query to a NON-TECHNICAL auditor who does not read SQL. "
+    "Given their question and the query, write 1-2 short plain-English sentences describing "
+    "what the query looks for and the time window it covers. "
+    "No SQL keywords, no table or column names, no markdown, no code — just a clear explanation."
+)
+
 
 class GenerateRequest(BaseModel):
     question: str = Field(min_length=3, max_length=2000)
@@ -225,7 +234,15 @@ def generate_sql(req: GenerateRequest):
         ok, reason = validate_sql(sql)
     if not ok:
         raise HTTPException(422, f"could not produce a safe query: {reason}")
-    return {"sql": sql}
+    # Best-effort plain-language explanation; never fail generation if it errors.
+    explanation = ""
+    try:
+        explanation = _invoke(
+            EXPLAIN_SYSTEM, f"Question: {req.question}\n\nSQL:\n{sql}", max_tokens=256, model_id=req.model_id
+        )
+    except HTTPException:
+        explanation = ""
+    return {"sql": sql, "explanation": explanation}
 
 
 @app.post("/api/execute-sql", dependencies=[Depends(require_auth)])

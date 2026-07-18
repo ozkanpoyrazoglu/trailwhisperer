@@ -6,6 +6,8 @@
 
 const API = new URLSearchParams(location.search).get("api") || "http://localhost:8000";
 const TOKEN_KEY = "trailwhisperer.token";
+const AUTO_KEY = "trailwhisperer.autorun";
+const AUTO_SECONDS = 5;
 const MODEL_KEY = "trailwhisperer.model";
 const CUSTOM_MODEL_KEY = "trailwhisperer.model.custom";
 const CUSTOM = "__custom__";
@@ -21,10 +23,11 @@ const el = {
   authScrim: $("authScrim"), authForm: $("authForm"), tokenInput: $("tokenInput"),
   saveToken: $("saveToken"), revealToken: $("revealToken"), authNote: $("authNote"),
   sqlScrim: $("sqlScrim"), sqlBox: $("sqlBox"), warrantMeta: $("warrantMeta"),
+  warrantExplain: $("warrantExplain"), explainText: $("explainText"),
   approveSql: $("approveSql"), cancelSql: $("cancelSql"), scopeText: $("scopeText"),
+  autoRun: $("autoRun"), sqlCountdown: $("sqlCountdown"), countNum: $("countNum"), pauseAuto: $("pauseAuto"),
   toasts: $("toasts"),
-  caseLogBtn: $("caseLogBtn"), caseCount: $("caseCount"), caseWrap: $("caseWrap"),
-  caseList: $("caseList"), caseEmpty: $("caseEmpty"), closeCase: $("closeCase"), clearCase: $("clearCase"),
+  caseCount: $("caseCount"), caseList: $("caseList"), caseEmpty: $("caseEmpty"), clearCase: $("clearCase"),
 };
 
 let token = localStorage.getItem(TOKEN_KEY) || "";
@@ -130,8 +133,37 @@ function addAsk(question) {
   return addEntry(`<div class="ask-row"><div class="ask-bubble">${esc(question)}</div></div>`);
 }
 
-function addStatus(text) {
-  return addEntry(`<div class="status"><span class="spinner"></span><span>${esc(text)}</span></div>`);
+/* Rotating "thinking" status — cycles through analyst-style lines with a
+   shimmer + fade so a wait feels alive (like a model reasoning out loud).
+   Returns the entry node with a .stop() to clear its timer before removal. */
+const THINK_GENERATE = [
+  "Reading your question…",
+  "Consulting the CloudTrail & VPC Flow Logs schema…",
+  "Choosing the right table and time window…",
+  "Drafting a safe, read-only Athena query…",
+];
+const THINK_EXECUTE = [
+  "Pruning partitions to your time window…",
+  "Scanning matching log records on Athena…",
+  "Correlating events across the trail…",
+  "Distilling what the logs actually say…",
+];
+
+function addThinking(messages) {
+  const node = addEntry(
+    `<div class="status thinking"><span class="spinner"></span><span class="status-msg swap">${esc(messages[0])}</span></div>`
+  );
+  const msgEl = node.querySelector(".status-msg");
+  let i = 0;
+  const timer = setInterval(() => {
+    i = (i + 1) % messages.length;
+    msgEl.classList.remove("swap");
+    void msgEl.offsetWidth; // restart the fade animation
+    msgEl.textContent = messages[i];
+    msgEl.classList.add("swap");
+  }, 2400);
+  node.stop = () => clearInterval(timer);
+  return node;
 }
 
 function addError(title, detail) {
@@ -198,7 +230,7 @@ function recordCase(question, data, sev, entryNode) {
   entryNode.dataset.caseId = id;
   history.unshift({ id, question, sev, rows: data.row_count || 0, bytes: data.bytes_scanned, ts: Date.now() });
   updateCaseCount();
-  if (!el.caseWrap.hidden) renderCaseList();
+  renderCaseList();
 }
 
 function updateCaseCount() {
@@ -224,12 +256,8 @@ function renderCaseList() {
     </div>`).join("");
 }
 
-function openCase() { renderCaseList(); el.caseWrap.hidden = false; setTimeout(() => el.closeCase.focus(), 60); }
-function closeCase() { el.caseWrap.hidden = true; }
-
 function jumpToCase(id) {
   const node = [...el.thread.querySelectorAll(".entry")].find((n) => n.dataset.caseId === id);
-  closeCase();
   if (!node) return;
   node.scrollIntoView({ behavior: "smooth", block: "center" });
   node.classList.remove("flash");
@@ -237,7 +265,7 @@ function jumpToCase(id) {
   node.classList.add("flash");
 }
 
-function rerunCase(question) { closeCase(); investigate(question); }
+function rerunCase(question) { investigate(question); }
 
 /* --------------------------- auth token modal --------------------------- */
 function openAuth(force = false) {
@@ -263,9 +291,12 @@ function saveToken() {
 }
 
 /* ---------------------------- SQL warrant ------------------------------- */
-function openSql(sql, question) {
+function openSql(sql, question, explanation) {
   pending = { question };
   el.sqlBox.value = sql;
+  const expl = (explanation || "").trim();
+  el.explainText.textContent = expl;
+  el.warrantExplain.hidden = !expl;
   const source = /vpc_flow_logs/i.test(sql) ? "VPC Flow Logs" : "CloudTrail";
   el.warrantMeta.innerHTML = `
     <span class="tag">engine <b>Athena · Trino</b></span>
@@ -273,9 +304,43 @@ function openSql(sql, question) {
     <span class="tag">source <b>${source}</b></span>`;
   el.scopeText.textContent = "bounded by workgroup cutoff";
   el.sqlScrim.hidden = false;
-  setTimeout(() => el.sqlBox.focus(), 60);
+  // Auto-run: keep the query on screen but approve after a cancellable
+  // countdown. Editing the SQL cancels it (the user wants a closer look).
+  if (el.autoRun.checked) startCountdown();
+  else { setTimeout(() => el.sqlBox.focus(), 60); }
 }
-function closeSql() { el.sqlScrim.hidden = true; pending = null; }
+function closeSql() { el.sqlScrim.hidden = true; pending = null; cancelCountdown(); }
+
+/* ------------------------- auto-run countdown --------------------------- */
+let countdownTimer = null;
+
+function startCountdown() {
+  cancelCountdown();
+  let left = AUTO_SECONDS;
+  el.countNum.textContent = left;
+  el.sqlCountdown.hidden = false;
+  const bar = el.sqlCountdown.querySelector(".auto-bar i");
+  bar.style.animation = "none";
+  void bar.offsetWidth; // reset
+  bar.style.animationDuration = `${AUTO_SECONDS}s`;
+  bar.classList.add("run");
+  countdownTimer = setInterval(() => {
+    left -= 1;
+    el.countNum.textContent = Math.max(left, 0);
+    if (left <= 0) {
+      cancelCountdown();
+      if (!el.sqlScrim.hidden && pending) runApproved();
+    }
+  }, 1000);
+}
+
+function cancelCountdown() {
+  if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null; }
+  el.sqlCountdown.hidden = true;
+  const bar = el.sqlCountdown.querySelector(".auto-bar i");
+  bar.classList.remove("run");
+  bar.style.animation = "none";
+}
 
 /* ------------------------------ actions --------------------------------- */
 function setBusy(state) {
@@ -290,13 +355,13 @@ async function investigate(question) {
   el.question.value = "";
   autoGrow();
   setBusy(true);
-  const status = addStatus("Drafting an Athena query from your question…");
+  const status = addThinking(THINK_GENERATE);
   try {
-    const { sql } = await api("/api/generate-sql", { method: "POST", body: { question, model_id: currentModel() } });
-    status.remove();
-    openSql(sql, question);
+    const { sql, explanation } = await api("/api/generate-sql", { method: "POST", body: { question, model_id: currentModel() } });
+    status.stop(); status.remove();
+    openSql(sql, question, explanation);
   } catch (e) {
-    status.remove();
+    status.stop(); status.remove();
     addError("Couldn't draft a safe query", e.message);
   } finally {
     setBusy(false);
@@ -309,31 +374,30 @@ async function runApproved() {
   if (!sql) return;
   closeSql();
   setBusy(true);
-  const status = addStatus("Running the approved query on Athena…");
+  const status = addThinking(THINK_EXECUTE);
   try {
     const { execution_id } = await api("/api/execute-sql", { method: "POST", body: { sql } });
-    const data = await pollResults(execution_id, question, status);
-    status.remove();
+    const data = await pollResults(execution_id, question);
+    status.stop(); status.remove();
     if (data.status === "failed") {
       addError("Athena query failed", data.error || "The query did not succeed.");
     } else {
       renderResults(data, question);
     }
   } catch (e) {
-    status.remove();
+    status.stop(); status.remove();
     addError("Execution error", e.message);
   } finally {
     setBusy(false);
   }
 }
 
-async function pollResults(id, question, status) {
+async function pollResults(id, question) {
   const q = `?question=${encodeURIComponent(question)}&model_id=${encodeURIComponent(currentModel())}`;
   for (let i = 0; i < POLL_MAX; i++) {
     const data = await api(`/api/results/${id}${q}`);
     if (data.status !== "running") return data;
-    if (status) status.querySelector("span:last-child").textContent =
-      `Scanning CloudTrail on Athena… (${i + 1})`;
+    // The rotating thinking-status conveys progress; no per-poll text needed.
     await new Promise((r) => setTimeout(r, POLL_MS));
   }
   throw new Error("Timed out waiting for Athena results.");
@@ -345,15 +409,17 @@ async function checkHealth() {
     const res = await fetch(`${API}/api/health`);
     const d = await res.json();
     el.health.dataset.state = "ok";
-    el.health.querySelector(".label").textContent = d.model ? `online · ${shortModel(d.model)}` : "online";
-    el.health.title = `Backend online — ${(d.tables || [d.table]).filter(Boolean).join(", ")}`;
+    // Connectivity only — the model in use is the picker selection (sent per
+    // request), not the backend default, so showing d.model here misleads.
+    el.health.querySelector(".label").textContent = "online";
+    const tables = (d.tables || [d.table]).filter(Boolean).join(", ");
+    el.health.title = `Backend online${d.model ? ` · default model ${d.model}` : ""}${tables ? ` — ${tables}` : ""}`;
   } catch {
     el.health.dataset.state = "down";
     el.health.querySelector(".label").textContent = "backend offline";
     el.health.title = `Cannot reach ${API}`;
   }
 }
-const shortModel = (m) => (m.includes("claude") ? m.replace(/^.*?(claude[\w.-]*?)(?:-v\d.*|:.*)?$/i, "$1").slice(0, 22) : m.slice(0, 22));
 
 /* ----------------------------- model picker ----------------------------- */
 let lastRealModel = el.modelSelect.value;
@@ -410,10 +476,7 @@ el.customBack.addEventListener("click", () => {
   persistModel();
 });
 
-el.caseLogBtn.addEventListener("click", openCase);
-el.closeCase.addEventListener("click", closeCase);
 el.clearCase.addEventListener("click", () => { history.length = 0; updateCaseCount(); renderCaseList(); });
-el.caseWrap.addEventListener("click", (e) => { if (e.target.matches("[data-close]")) closeCase(); });
 el.caseList.addEventListener("click", (e) => {
   const rerun = e.target.closest("[data-rerun]");
   if (rerun) { e.stopPropagation(); const h = history.find((x) => x.id === rerun.dataset.rerun); if (h) rerunCase(h.question); return; }
@@ -440,6 +503,16 @@ el.revealToken.addEventListener("click", () => {
 el.approveSql.addEventListener("click", runApproved);
 el.cancelSql.addEventListener("click", () => { closeSql(); addNote("Query cancelled — nothing was run."); });
 
+// Auto-run toggle: persist, and stop any running countdown if switched off.
+el.autoRun.addEventListener("change", () => {
+  localStorage.setItem(AUTO_KEY, el.autoRun.checked ? "1" : "0");
+  if (!el.autoRun.checked) cancelCountdown();
+});
+// Any intent to review/edit the SQL cancels the auto-run countdown.
+el.pauseAuto.addEventListener("click", () => { cancelCountdown(); el.sqlBox.focus(); });
+el.sqlBox.addEventListener("focus", cancelCountdown);
+el.sqlBox.addEventListener("input", cancelCountdown);
+
 // Backdrop click + Escape close whichever modal is open.
 [el.authScrim, el.sqlScrim].forEach((s) =>
   s.addEventListener("click", (e) => {
@@ -450,8 +523,7 @@ el.cancelSql.addEventListener("click", () => { closeSql(); addNote("Query cancel
 );
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
-  if (!el.caseWrap.hidden) closeCase();
-  else if (!el.sqlScrim.hidden) { closeSql(); addNote("Query cancelled — nothing was run."); }
+  if (!el.sqlScrim.hidden) { closeSql(); addNote("Query cancelled — nothing was run."); }
   else if (!el.authScrim.hidden && token) closeAuth();
 });
 
@@ -462,8 +534,11 @@ el.customModel.value = localStorage.getItem(CUSTOM_MODEL_KEY) || "";
 if (el.modelSelect.value === CUSTOM) setCustomMode(true);
 else lastRealModel = el.modelSelect.value;
 
+el.autoRun.checked = localStorage.getItem(AUTO_KEY) === "1";
+
 if (token) el.keyBtn.dataset.set = "true";
 else openAuth();
 autoGrow();
 updateCaseCount();
+renderCaseList();
 checkHealth();

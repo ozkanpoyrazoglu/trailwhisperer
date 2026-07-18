@@ -141,6 +141,26 @@ def _scenario(question: str):
     return sql, cols, rows, summary, flags
 
 
+def _explain(question: str) -> str:
+    """Plain-language rendering of the generated query for the local demo,
+    mirroring the branches in _scenario()."""
+    q = question.lower()
+    if re.search(r"login|console|signin|sign-in", q):
+        return ("Finds failed attempts to sign in to the AWS console over the last 3 days, "
+                "showing who tried, the IP address they came from, and why each attempt failed.")
+    if re.search(r"\biam\b|policy|role|permission", q):
+        return ("Looks for changes to user and role permissions in the past 24 hours — such as "
+                "policies being attached — so you can spot anyone gaining new access.")
+    if re.search(r"vpc|flow log|network|traffic|reject|port \d|inbound|outbound|connection", q):
+        return ("Lists network connection attempts to your internal hosts on the SSH port that were "
+                "blocked in the last day, including where each attempt came from.")
+    if re.search(r"root", q):
+        return ("Checks for any use of the all-powerful root account over the past 30 days, "
+                "showing what it did, when, and from where.")
+    return ("Finds who created or changed firewall (security-group) rules in the past week, "
+            "including when the change happened and the IP address behind it.")
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # quieter console
         print(f"  {self.command} {self.path} -> {args[1]}")
@@ -221,7 +241,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(422, {"detail": "question too short"})
             sql, *_ = _scenario(question)
             time.sleep(0.6)  # feel like a real model round-trip
-            return self._send(200, {"sql": sql})
+            return self._send(200, {"sql": sql, "explanation": _explain(question)})
 
         if self.path == "/api/execute-sql":
             data = self._read_json()
