@@ -252,6 +252,9 @@ Resources:
     Properties:
       Name: !Sub "${AWS::StackName}-wg"
       State: ENABLED
+      # Allow CFN to delete the workgroup even when it still holds query-execution
+      # history — otherwise delete-stack fails with "WorkGroup ... is not empty".
+      RecursiveDeleteOption: true
       WorkGroupConfiguration:
         EnforceWorkGroupConfiguration: true
         BytesScannedCutoffPerQuery: !Ref BytesScannedCutoff
