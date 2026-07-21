@@ -6,10 +6,13 @@
   <title>TrailWhisperer — Natural-language CloudTrail investigator</title>
   <meta name="color-scheme" content="dark light" />
 
+  <link rel="icon" type="image/svg+xml" href="favicon-light.svg" media="(prefers-color-scheme: light)" />
+  <link rel="icon" type="image/svg+xml" href="favicon-dark.svg" media="(prefers-color-scheme: dark)" />
+
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link
-    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap"
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=Sora:wght@700&display=swap"
     rel="stylesheet" />
 
   <link rel="stylesheet" href="style.css" />
@@ -19,16 +22,9 @@
     <!-- Sidebar (persistent left panel) --------------------------------- -->
     <aside class="sidebar" id="sidebar">
       <div class="brand">
-        <span class="sigil" aria-hidden="true">
-          <!-- waveform / signal trace -->
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M2 12h3l2-7 3 15 3-11 2 5h7" />
-          </svg>
-        </span>
-        <div>
-          <h1>TrailWhisperer</h1>
-          <span class="kicker">CloudTrail · NL audit</span>
-        </div>
+        <!-- icon-free "Hue Drift" wordmark -->
+        <h1 class="wordmark">Trail<span class="wordmark-drift">Whisperer</span></h1>
+        <span class="kicker">CloudTrail · NL audit</span>
       </div>
 
       <!-- Case log (persistent) ----------------------------------------- -->
