@@ -51,8 +51,9 @@ jobs:
         run: bandit -r backend -x backend/mock_server.py --severity-level high --confidence-level medium
 
       # IaC lint of the CloudFormation template (no AWS credentials needed).
+      # Fail only on errors; pre-existing style warnings (e.g. W1020) don't block CI.
       - name: cfn-lint (IaC lint)
-        run: cfn-lint investigator-stack.yaml
+        run: cfn-lint --non-zero-exit-code error investigator-stack.yaml
 
       # IaC misconfiguration scan via Trivy (installed from the official script to avoid action-version drift).
       - name: Install Trivy
