@@ -696,6 +696,9 @@ Resources:
                   - !Sub "${SpaBucket.Arn}/*"
                   - !GetAtt AthenaResultsBucket.Arn
                   - !Sub "${AthenaResultsBucket.Arn}/*"
+                  # Emptied on stack delete so CFN can drop the (non-empty) bucket.
+                  - !If [HasProwler, !GetAtt ProwlerFindingsBucket.Arn, !Ref "AWS::NoValue"]
+                  - !If [HasProwler, !Sub "${ProwlerFindingsBucket.Arn}/*", !Ref "AWS::NoValue"]
               - Sid: Invalidate
                 Effect: Allow
                 Action: cloudfront:CreateInvalidation
@@ -728,19 +731,27 @@ Resources:
               urllib.request.urlopen(req)
 
           def empty(bucket):
-              p = s3.get_paginator("list_objects_v2")
-              for page in p.paginate(Bucket=bucket):
-                  keys = [{"Key": o["Key"]} for o in page.get("Contents", [])]
-                  if keys:
-                      s3.delete_objects(Bucket=bucket, Delete={"Objects": keys})
+              # Best-effort: a missing/absent bucket must not fail the stack delete.
+              if not bucket:
+                  return
+              try:
+                  p = s3.get_paginator("list_objects_v2")
+                  for page in p.paginate(Bucket=bucket):
+                      keys = [{"Key": o["Key"]} for o in page.get("Contents", [])]
+                      if keys:
+                          s3.delete_objects(Bucket=bucket, Delete={"Objects": keys})
+              except Exception as e:
+                  print("empty skipped for", bucket, ":", e)
 
           def handler(event, context):
               try:
                   props = event["ResourceProperties"]
                   spa = props["SpaBucket"]
                   if event["RequestType"] == "Delete":
+                      # Empty every stack-created bucket so CFN can delete them.
                       empty(spa)
-                      empty(props["ResultsBucket"])
+                      empty(props.get("ResultsBucket"))
+                      empty(props.get("ProwlerBucket"))
                       return respond(event, context, "SUCCESS", "emptied buckets")
 
                   art, ver, prefix = props["ArtifactBucket"], props["ArtifactVersion"], props["ArtifactVersion"].rstrip("/") + "/frontend/"
@@ -779,6 +790,9 @@ Resources:
       ArtifactVersion: !Ref ArtifactVersion
       SpaBucket: !Ref SpaBucket
       ResultsBucket: !Ref AthenaResultsBucket
+      # Referenced so CFN empties this bucket (via the deployer's Delete handler)
+      # before deleting it, avoiding a "bucket not empty" (409) on stack teardown.
+      ProwlerBucket: !If [HasProwler, !Ref ProwlerFindingsBucket, !Ref "AWS::NoValue"]
       DistributionId: !Ref SpaDistribution
       ApiUrl: !GetAtt HttpApi.ApiEndpoint
 
