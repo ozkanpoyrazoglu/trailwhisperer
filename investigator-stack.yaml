@@ -22,8 +22,11 @@ Parameters:
     Default: vpc_flow_logs
   BedrockModelId:
     Type: String
-    Default: anthropic.claude-3-5-sonnet-20241022-v2:0
-    Description: Bedrock model id used for NL->SQL and summarization.
+    Default: global.anthropic.claude-sonnet-4-6
+    Description: >-
+      Bedrock model id (or cross-region inference profile) used for NL->SQL and
+      summarization. The account must have model access granted for it in the
+      deploy region.
   BytesScannedCutoff:
     Type: Number
     Default: 1073741824
@@ -526,9 +529,12 @@ Resources:
                 # Invoking a profile requires permission on BOTH the inference-profile ARN and the
                 # underlying foundation-model ARNs in every region the profile can route to. We grant
                 # the profile in this account/region and the foundation model across all regions.
+                # The UI model picker also offers profiles other than BedrockModelId,
+                # so the profile ARN is wildcarded within this account — matching the
+                # foundation-model wildcard that already exists below.
                 Resource:
                   - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}"
-                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${BedrockModelId}"
+                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*"
                   - !Sub "arn:aws:bedrock:*::foundation-model/*"
               - Sid: Athena
                 Effect: Allow

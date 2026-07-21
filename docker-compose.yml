@@ -11,7 +11,7 @@ services:
       GLUE_TABLE: ${GLUE_TABLE:-cloudtrail_logs}
       GLUE_VPC_TABLE: ${GLUE_VPC_TABLE:-vpc_flow_logs}
       ATHENA_WORKGROUP: ${ATHENA_WORKGROUP:-primary}
-      BEDROCK_MODEL_ID: ${BEDROCK_MODEL_ID:-anthropic.claude-3-5-sonnet-20241022-v2:0}
+      BEDROCK_MODEL_ID: ${BEDROCK_MODEL_ID:-global.anthropic.claude-sonnet-4-6}
       BYTES_SCANNED_CUTOFF: ${BYTES_SCANNED_CUTOFF:-1073741824}
       ALLOWED_TIME_RANGE_MAX_DAYS: ${ALLOWED_TIME_RANGE_MAX_DAYS:-90}
       AUTH_TOKEN: ${AUTH_TOKEN:-local-dev-token}
