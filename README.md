@@ -55,6 +55,48 @@ API Gateway (HTTP API)  →  Lambda (FastAPI + Mangum, Python 3.13)
 
 ---
 
+## Cost
+
+TrailWhisperer is built to cost **almost nothing when idle** and only a few cents per investigation when used. There is no always-on compute (no NAT gateway, EC2, Redshift, Glue Crawler, or OpenSearch), so a deployed-but-unused stack drifts toward zero.
+
+> ⚠️ **These are rough, order-of-magnitude estimates** (us-east-1, early 2026) to set expectations — **not** a billing guarantee. Actual charges depend on your region, the Bedrock model you pick, how much data Athena scans, and how often you query. Always confirm against the [AWS pricing pages](https://aws.amazon.com/pricing/) and your own Cost Explorer.
+
+### Idle cost (deployed, no queries)
+
+| Resource | Idle charge |
+|---|---|
+| Lambda, API Gateway, Athena, Bedrock | **$0** — pay-per-use, nothing runs when idle |
+| DynamoDB (`PAY_PER_REQUEST` sessions table) | **$0** idle; rows auto-expire via TTL |
+| Glue Data Catalog (partition projection, no crawler) | **$0** (free under 1M objects) |
+| Secrets Manager (auth token) | **~$0.40 / month** per secret |
+| S3 (SPA + Athena results w/ 7-day lifecycle) | **pennies / month** (tiny objects, results expire) |
+| CloudFront | **~$0** idle (pay per request/GB served) |
+
+**Idle total: well under ~$1/month**, dominated by the one Secrets Manager secret.
+
+### Per-investigation cost
+
+Each question makes up to 3 Bedrock calls (generate SQL → plain-language explanation → summarize) plus one Athena query:
+
+- **Athena** — **$5 per TB scanned**, and the workgroup enforces a `BytesScannedCutoff` (default **1 GB → ≤ $0.005/query** hard cap). The mandatory `dt` partition pruning keeps typical queries far below that, so most investigations cost a **fraction of a cent** in Athena.
+- **Bedrock** — priced per token; the grounded system prompt (~8K tokens) is re-sent on each generation (no prompt caching yet). Rough cost per investigation by model:
+
+  | Bedrock model | Approx. $/1M in / out | ~Per investigation |
+  |---|---|---|
+  | Claude 3.5 Sonnet v2 *(default)* | ~$3 / ~$15 | **~$0.03–0.08** |
+  | Claude 3.5 Haiku / Nova Lite | ~$0.80–1 / ~$4–5 | **~$0.01–0.02** |
+  | Amazon Nova Micro | ~$0.035 / ~$0.14 | **sub-cent** |
+
+  Switch models in the composer's model picker to trade cost for quality. (Bedrock token prices are set by AWS and vary by model/region — check the [Bedrock pricing page](https://aws.amazon.com/bedrock/pricing/).)
+
+**Rule of thumb:** a day of active investigating on the default model is typically **cents to low single-digit dollars**.
+
+### Optional Prowler scan cost
+
+If you enable `EnableProwlerScan` (see below), a scan runs on **CodeBuild** (`BUILD_GENERAL1_SMALL`, ~$0.005/build-minute). A full 15–45 min account scan is **~$0.08–0.25 per run**, plus negligible S3 storage for the JSON findings. It only runs when you trigger it, so it adds nothing to idle cost.
+
+---
+
 ## Deploying to AWS
 
 Deployment is **one click**: the CloudFormation stack pulls the packaged backend from a release bucket, and a bundled custom resource publishes the SPA (with the live API URL baked into `config.js`) into S3 — no manual Lambda upload, no manual S3 sync, no `?api=` wiring.
