@@ -12,10 +12,10 @@ const API =
 const TOKEN_KEY = "trailwhisperer.token";
 const SESSION_KEY = "trailwhisperer.session";
 const AUTO_KEY = "trailwhisperer.autorun";
-const AUTO_SECONDS = 5;
 const MODEL_KEY = "trailwhisperer.model";
 const CUSTOM_MODEL_KEY = "trailwhisperer.model.custom";
 const HELP_KEY = "trailwhisperer.helppanel";
+const THEME_KEY = "trailwhisperer.theme";
 const CUSTOM = "__custom__";
 const POLL_MS = 1300;
 const POLL_MAX = 90; // ~2 min ceiling
@@ -31,10 +31,11 @@ const el = {
   sqlScrim: $("sqlScrim"), sqlBox: $("sqlBox"), warrantMeta: $("warrantMeta"),
   warrantExplain: $("warrantExplain"), explainText: $("explainText"),
   approveSql: $("approveSql"), cancelSql: $("cancelSql"), scopeText: $("scopeText"),
-  autoRun: $("autoRun"), sqlCountdown: $("sqlCountdown"), countNum: $("countNum"), pauseAuto: $("pauseAuto"),
+  autoRun: $("autoRun"),
   toasts: $("toasts"),
   caseCount: $("caseCount"), caseList: $("caseList"), caseEmpty: $("caseEmpty"), clearCase: $("clearCase"),
   app: $("app"), helpToggle: $("helpToggle"), helpClose: $("helpClose"),
+  themeToggle: $("themeToggle"),
 };
 
 let token = localStorage.getItem(TOKEN_KEY) || "";
@@ -146,7 +147,15 @@ function addEntry(html) {
 }
 
 function addAsk(question) {
-  return addEntry(`<div class="ask-row"><div class="ask-bubble">${esc(question)}</div></div>`);
+  return addEntry(`<div class="turn user"><div class="bubble">${esc(question)}</div></div>`);
+}
+
+/* Analyst turn scaffold — a signal monogram in the left rail + content body.
+   Used by the thinking status, plain-text replies, findings, and errors so
+   every non-user message shares one conversational rhythm. */
+const AVATAR = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12h3l2-7 3 15 3-11 2 5h7"/></svg>`;
+function agentTurn(inner, thinking = false) {
+  return `<div class="turn agent${thinking ? " is-thinking" : ""}"><span class="avatar" aria-hidden="true">${AVATAR}</span><div class="turn-body">${inner}</div></div>`;
 }
 
 /* Rotating "thinking" status — cycles through analyst-style lines with a
@@ -167,7 +176,7 @@ const THINK_EXECUTE = [
 
 function addThinking(messages) {
   const node = addEntry(
-    `<div class="status thinking"><span class="spinner"></span><span class="status-msg swap">${esc(messages[0])}</span></div>`
+    agentTurn(`<div class="thinking"><span class="status-msg swap">${esc(messages[0])}</span></div>`, true)
   );
   const msgEl = node.querySelector(".status-msg");
   let i = 0;
@@ -183,24 +192,20 @@ function addThinking(messages) {
 }
 
 function addError(title, detail) {
-  return addEntry(`
+  return addEntry(agentTurn(`
     <div class="card error">
       <div class="card-head"><span class="tick"></span>${esc(title)}</div>
       <div class="body">${esc(detail)}</div>
-    </div>`);
+    </div>`));
 }
 
 function addNote(text) {
-  return addEntry(`<div class="status" style="border-style:dashed">${esc(text)}</div>`);
+  return addEntry(`<div class="note">${esc(text)}</div>`);
 }
 
 // A plain-text analyst reply (model answered from conversation memory — no query).
 function addAssistant(text) {
-  return addEntry(`
-    <div class="card">
-      <div class="card-head"><span class="tick"></span>Analyst</div>
-      <div class="narrative"><p>${esc(text)}</p></div>
-    </div>`);
+  return addEntry(agentTurn(`<div class="reply"><p>${esc(text)}</p></div>`));
 }
 
 function renderResults(data, question) {
@@ -236,13 +241,13 @@ function renderResults(data, question) {
   }
 
   const meta = `${fmtBytes(data.bytes_scanned)} scanned · ${fmtCost(data.bytes_scanned)}`;
-  const node = addEntry(`
+  const node = addEntry(agentTurn(`
     <div class="card" data-sev="${cardSev}">
       <div class="card-head"><span class="tick"></span>Findings<span class="meta">${meta}</span></div>
       ${data.summary ? `<div class="narrative"><p>${esc(data.summary)}</p></div>` : ""}
       ${flags ? `<div class="flags">${flags}</div>` : ""}
       ${table}
-    </div>`);
+    </div>`));
   recordCase(question, data, cardSev, node);
 }
 
@@ -329,43 +334,9 @@ function openSql(sql, question, explanation) {
     <span class="tag">source <b>${source}</b></span>`;
   el.scopeText.textContent = "bounded by workgroup cutoff";
   el.sqlScrim.hidden = false;
-  // Auto-run: keep the query on screen but approve after a cancellable
-  // countdown. Editing the SQL cancels it (the user wants a closer look).
-  if (el.autoRun.checked) startCountdown();
-  else { setTimeout(() => el.sqlBox.focus(), 60); }
+  setTimeout(() => el.sqlBox.focus(), 60);
 }
-function closeSql() { el.sqlScrim.hidden = true; pending = null; cancelCountdown(); }
-
-/* ------------------------- auto-run countdown --------------------------- */
-let countdownTimer = null;
-
-function startCountdown() {
-  cancelCountdown();
-  let left = AUTO_SECONDS;
-  el.countNum.textContent = left;
-  el.sqlCountdown.hidden = false;
-  const bar = el.sqlCountdown.querySelector(".auto-bar i");
-  bar.style.animation = "none";
-  void bar.offsetWidth; // reset
-  bar.style.animationDuration = `${AUTO_SECONDS}s`;
-  bar.classList.add("run");
-  countdownTimer = setInterval(() => {
-    left -= 1;
-    el.countNum.textContent = Math.max(left, 0);
-    if (left <= 0) {
-      cancelCountdown();
-      if (!el.sqlScrim.hidden && pending) runApproved();
-    }
-  }, 1000);
-}
-
-function cancelCountdown() {
-  if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null; }
-  el.sqlCountdown.hidden = true;
-  const bar = el.sqlCountdown.querySelector(".auto-bar i");
-  bar.classList.remove("run");
-  bar.style.animation = "none";
-}
+function closeSql() { el.sqlScrim.hidden = true; pending = null; }
 
 /* ------------------------------ actions --------------------------------- */
 function setBusy(state) {
@@ -385,8 +356,10 @@ async function investigate(question) {
     const resp = await api("/api/generate-sql", { method: "POST", body: { question, model_id: currentModel(), session_id: sessionId } });
     status.stop(); status.remove();
     // Agentic routing: the model either answered from memory (chat_response) or
-    // proposed a query (sql) that still needs human approval before it runs.
+    // proposed a query (sql). With auto-run ON the query runs immediately with
+    // no approval step; otherwise it's shown in the warrant modal for approval.
     if (resp.chat_response) addAssistant(resp.chat_response);
+    else if (el.autoRun.checked) await executeSql(resp.sql, question);
     else openSql(resp.sql, question, resp.explanation);
   } catch (e) {
     status.stop(); status.remove();
@@ -396,11 +369,19 @@ async function investigate(question) {
   }
 }
 
+// Manual approval path: run the SQL currently shown in the warrant modal.
 async function runApproved() {
   const question = pending?.question || "";
   const sql = el.sqlBox.value.trim();
   if (!sql) return;
   closeSql();
+  await executeSql(sql, question);
+}
+
+// Execute an (already validated) query on Athena and render the results.
+// Shared by manual approval and the auto-run path.
+async function executeSql(sql, question) {
+  if (!sql) return;
   setBusy(true);
   const status = addThinking(THINK_EXECUTE);
   try {
@@ -471,6 +452,24 @@ function persistModel() {
   localStorage.setItem(CUSTOM_MODEL_KEY, el.customModel.value.trim());
 }
 
+/* ------------------------------- theme ---------------------------------- */
+// Resolve the initial theme: explicit saved choice wins, else follow the OS.
+function initialTheme() {
+  const saved = localStorage.getItem(THEME_KEY);
+  if (saved === "light" || saved === "dark") return saved;
+  return window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches
+    ? "light" : "dark";
+}
+function applyTheme(theme) {
+  document.documentElement.setAttribute("data-theme", theme);
+  el.themeToggle.setAttribute("aria-pressed", theme === "light" ? "true" : "false");
+}
+function toggleTheme() {
+  const next = document.documentElement.getAttribute("data-theme") === "light" ? "dark" : "light";
+  localStorage.setItem(THEME_KEY, next);
+  applyTheme(next);
+}
+
 /* ---------------------------- composer UX ------------------------------- */
 function autoGrow() {
   el.question.style.height = "auto";
@@ -531,6 +530,8 @@ function setHelp(open) {
 el.helpToggle.addEventListener("click", () => setHelp(true));
 el.helpClose.addEventListener("click", () => setHelp(false));
 
+el.themeToggle.addEventListener("click", toggleTheme);
+
 el.keyBtn.addEventListener("click", () => openAuth());
 el.saveToken.addEventListener("click", saveToken);
 el.authForm.addEventListener("submit", (e) => { e.preventDefault(); saveToken(); });
@@ -541,15 +542,11 @@ el.revealToken.addEventListener("click", () => {
 el.approveSql.addEventListener("click", runApproved);
 el.cancelSql.addEventListener("click", () => { closeSql(); addNote("Query cancelled — nothing was run."); });
 
-// Auto-run toggle: persist, and stop any running countdown if switched off.
+// Auto-run toggle: persist. When on, approved queries run immediately with no
+// approval step (see investigate()).
 el.autoRun.addEventListener("change", () => {
   localStorage.setItem(AUTO_KEY, el.autoRun.checked ? "1" : "0");
-  if (!el.autoRun.checked) cancelCountdown();
 });
-// Any intent to review/edit the SQL cancels the auto-run countdown.
-el.pauseAuto.addEventListener("click", () => { cancelCountdown(); el.sqlBox.focus(); });
-el.sqlBox.addEventListener("focus", cancelCountdown);
-el.sqlBox.addEventListener("input", cancelCountdown);
 
 // Backdrop click + Escape close whichever modal is open.
 [el.authScrim, el.sqlScrim].forEach((s) =>
@@ -567,6 +564,8 @@ document.addEventListener("keydown", (e) => {
 });
 
 /* ------------------------------- boot ----------------------------------- */
+applyTheme(initialTheme());
+
 const savedModel = localStorage.getItem(MODEL_KEY);
 if (savedModel && [...el.modelSelect.options].some((o) => o.value === savedModel)) el.modelSelect.value = savedModel;
 el.customModel.value = localStorage.getItem(CUSTOM_MODEL_KEY) || "";
