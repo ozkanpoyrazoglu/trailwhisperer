@@ -194,17 +194,19 @@ Setting `EnableProwlerScan=true` provisions an optional [Prowler](https://github
 
 The orchestrator's prompt and guardrail learn the new table automatically (via the `GLUE_PROWLER_TABLE` env var): it is whitelisted for `SELECT`, but — because Prowler findings are a **point-in-time snapshot, not time-series** — it is **exempt from the mandatory `dt` partition filter** the log tables require.
 
-**Running a scan.** The scan is **not** scheduled by default — trigger it manually (or add your own EventBridge rule). CodeBuild runs the scan and writes findings to the bucket; a full account scan can take ~15–45 min:
+**Running a scan.** The stack **auto-runs the scan on deploy** — a bundled trigger (custom resource) starts the CodeBuild project as soon as `EnableProwlerScan=true` is applied, so you don't have to kick it off by hand. The build runs Prowler, flattens the nested ASFF output into Athena-ready JSONL (via `jq`), and writes it to the findings bucket's `athena/` prefix that the Glue table reads. A full account scan takes **~15–45 min** after the build starts.
+
+To **re-scan** later (Prowler is a point-in-time snapshot), either re-deploy the stack (any update re-fires the trigger) or start a build manually:
 
 ```bash
 aws codebuild start-build --project-name <ProwlerScanProjectName-from-outputs>
 ```
 
-Once findings land, ask things like *"List my critical Prowler findings"* or *"Which high-severity Prowler checks are failing?"* (sample chips for these are in the console's query library).
+Once the build finishes, ask things like *"List my critical Prowler findings"* or *"Which high-severity Prowler checks are failing?"* (sample chips for these are in the console's query library). If a scan hasn't completed yet, these queries return no rows.
 
 > **Correlation caveat — honest scope.** You can also ask *"did the open security groups flagged by Prowler receive any internet traffic?"*, which `UNION ALL`s the finding with VPC Flow Logs. This is a **heuristic, side-by-side correlation by port / internet-facing traffic — not a precise per-security-group join.** VPC Flow Logs record ENIs and IPs and carry **no security-group id**, so there is no key to tie a *specific* `sg-…` to specific flows. Treat it as a triage aid, not proof.
 
-> **Deploy tuning.** The Glue table advertises flat columns (`status`, `severity`, `check_id`, `resource_id`, …); Prowler's ASFF output is nested, so the SerDe field mapping and storage location may need adjusting against a real scan before Athena reads it cleanly (tracked under roadmap Phase 8 / Phase 19).
+> **Field-mapping note.** The CodeBuild `jq` step maps Prowler's ASFF fields to the Glue table's flat columns (`GeneratorId`→`check_id`, `Compliance.Status`→`PASS`/`FAIL`, `Severity.Label`→lowercase `severity`, `Resources[0]`→`resource_id`/`region`, etc.). These mappings are based on Prowler's current ASFF schema; if a Prowler version emits different field names, adjust the `jq` filter in the `ProwlerScanProject` buildspec. Check the CodeBuild build log — it prints `Findings rows: N` — to confirm the transform produced rows.
 
 ---
 

@@ -303,7 +303,7 @@ Resources:
             Statement:
               - Sid: WriteFindings
                 Effect: Allow
-                Action: [s3:PutObject, s3:GetObject, s3:ListBucket]
+                Action: [s3:PutObject, s3:GetObject, s3:ListBucket, s3:DeleteObject]
                 Resource:
                   - !GetAtt ProwlerFindingsBucket.Arn
                   - !Sub "${ProwlerFindingsBucket.Arn}/*"
@@ -320,7 +320,7 @@ Resources:
     Condition: HasProwler
     Properties:
       Name: !Sub "${AWS::StackName}-prowler-scan"
-      Description: Runs Prowler and writes JSON (ASFF) findings to the findings bucket.
+      Description: Runs Prowler and writes Athena-ready JSONL findings to the findings bucket.
       ServiceRole: !GetAtt ProwlerBuildRole.Arn
       TimeoutInMinutes: 120
       Artifacts:
@@ -334,13 +334,28 @@ Resources:
             Value: !Ref ProwlerFindingsBucket
       Source:
         Type: NO_SOURCE
+        # Run Prowler, then flatten its nested ASFF JSON *array* into newline-delimited
+        # JSON (one object per line) with EXACTLY the flat columns the Glue table
+        # exposes, so Athena's JSON SerDe (which expects JSONL) can read it directly.
+        # Written to a dedicated `athena/` prefix that ProwlerFindingsTable points at.
         BuildSpec: |
           version: 0.2
           phases:
             build:
               commands:
                 - pip install prowler
-                - prowler aws -M json-asff -B $PROWLER_BUCKET
+                # Prowler exits non-zero when it finds failing checks — that is a normal
+                # result here, not a build failure, so don't let it abort the build.
+                - prowler aws -M json-asff -o ./prowler-out || true
+                - |
+                  set -e
+                  ASFF=$(ls ./prowler-out/*.asff.json 2>/dev/null | head -1)
+                  if [ -z "$ASFF" ]; then echo "ERROR: no ASFF output produced"; exit 1; fi
+                  jq -c '.[] | {finding_uid: .Id, check_id: (.GeneratorId|sub("^prowler-";"")), check_title: .Title, status: (if ((.Compliance.Status // "")|ascii_upcase|startswith("PASS")) then "PASS" elif ((.Compliance.Status // "")|ascii_upcase|startswith("FAIL")) then "FAIL" else (.Compliance.Status // "") end), status_extended: .Description, severity: ((.Severity.Label // "")|ascii_downcase), service_name: (.GeneratorId|sub("^prowler-";"")|split("_")[0]), region: (.Resources[0].Region // .ProductFields.Region // ""), resource_id: (.Resources[0].Id // ""), resource_arn: (.Resources[0].Id // ""), account_id: .AwsAccountId}' "$ASFF" > findings.jsonl
+                  echo "Findings rows: $(wc -l < findings.jsonl)"
+                  # Replace the previous scan so the table always reflects the latest run.
+                  aws s3 rm "s3://$PROWLER_BUCKET/athena/" --recursive || true
+                  aws s3 cp findings.jsonl "s3://$PROWLER_BUCKET/athena/findings.jsonl"
 
   ProwlerFindingsTable:
     Type: AWS::Glue::Table
@@ -353,12 +368,12 @@ Resources:
         TableType: EXTERNAL_TABLE
         Parameters:
           classification: json
-        # Point at the Prowler JSON output. Prowler `-B` writes under `output/` in
-        # the bucket. NOTE: the flat columns below are the schema the orchestrator
-        # prompt advertises; the exact ASFF field paths may need SerDe `mapping.*`
-        # tuning at deploy time (Phase 8 live-deploy) — Prowler's ASFF is nested.
+        # Reads the JSONL the CodeBuild buildspec writes to the `athena/` prefix —
+        # one flat JSON object per line, keyed exactly to the columns below. (The raw
+        # nested ASFF array Prowler emits is NOT queryable by the JSON SerDe directly;
+        # the buildspec's jq step is what makes this table work.)
         StorageDescriptor:
-          Location: !Sub "s3://${ProwlerFindingsBucket}/output/"
+          Location: !Sub "s3://${ProwlerFindingsBucket}/athena/"
           InputFormat: org.apache.hadoop.mapred.TextInputFormat
           OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
           SerdeInfo:
@@ -377,6 +392,79 @@ Resources:
             - { Name: resource_id, Type: string }
             - { Name: resource_arn, Type: string }
             - { Name: account_id, Type: string }
+
+  # Auto-run the Prowler scan on deploy (Create/Update) so enabling the feature
+  # actually produces findings — no manual `codebuild start-build` needed. The
+  # trigger only STARTS the build (async) and returns; it does not wait for the
+  # 15-45 min scan to finish, so the stack completes promptly.
+  ProwlerTriggerRole:
+    Type: AWS::IAM::Role
+    Condition: HasProwler
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: start-prowler-scan
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: codebuild:StartBuild
+                Resource: !GetAtt ProwlerScanProject.Arn
+
+  ProwlerTriggerFunction:
+    Type: AWS::Lambda::Function
+    Condition: HasProwler
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-prowler-trigger"
+      Runtime: python3.13
+      Handler: index.handler
+      Role: !GetAtt ProwlerTriggerRole.Arn
+      Timeout: 60
+      MemorySize: 128
+      Code:
+        ZipFile: |
+          import json, urllib.request, boto3
+          cb = boto3.client("codebuild")
+
+          def respond(event, context, status, reason=""):
+              body = json.dumps({
+                  "Status": status, "Reason": reason or f"See CloudWatch: {context.log_stream_name}",
+                  "PhysicalResourceId": event.get("PhysicalResourceId") or context.log_stream_name,
+                  "StackId": event["StackId"], "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"], "Data": {},
+              }).encode()
+              req = urllib.request.Request(event["ResponseURL"], data=body, method="PUT",
+                                           headers={"content-type": "", "content-length": str(len(body))})
+              urllib.request.urlopen(req)
+
+          def handler(event, context):
+              try:
+                  if event["RequestType"] in ("Create", "Update"):
+                      build = cb.start_build(projectName=event["ResourceProperties"]["ProjectName"])
+                      print("started build:", build["build"]["id"])
+                      respond(event, context, "SUCCESS", "prowler scan started")
+                  else:  # Delete — nothing to do
+                      respond(event, context, "SUCCESS", "noop")
+              except Exception as e:
+                  # A failed scan-trigger must NOT roll back the whole stack; the user
+                  # can always start the build manually. Log and succeed.
+                  print("ERROR:", e)
+                  respond(event, context, "SUCCESS", f"trigger error (start manually): {e}")
+
+  ProwlerScanTrigger:
+    Type: AWS::CloudFormation::CustomResource
+    Condition: HasProwler
+    DependsOn: ProwlerFindingsTable
+    Properties:
+      ServiceToken: !GetAtt ProwlerTriggerFunction.Arn
+      ProjectName: !Ref ProwlerScanProject
 
   InvestigatorWorkGroup:
     Type: AWS::Athena::WorkGroup
