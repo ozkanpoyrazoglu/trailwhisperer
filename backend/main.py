@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 from sqlglot import exp
 
 REGION = os.getenv("AWS_REGION", "us-east-1")
-MODEL_ID = os.getenv("BEDROCK_MODEL_ID", "anthropic.claude-3-5-sonnet-20241022-v2:0")
+MODEL_ID = os.getenv("BEDROCK_MODEL_ID", "global.anthropic.claude-sonnet-4-6")
 GLUE_DATABASE = os.getenv("GLUE_DATABASE", "trailwhisperer_db")
 GLUE_TABLE = os.getenv("GLUE_TABLE", "cloudtrail_logs")
 GLUE_VPC_TABLE = os.getenv("GLUE_VPC_TABLE", "vpc_flow_logs")
