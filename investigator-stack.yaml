@@ -118,6 +118,7 @@ Resources:
           TargetOriginId: SpaOrigin
           ViewerProtocolPolicy: redirect-to-https
           CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          ResponseHeadersPolicyId: !Ref SpaSecurityHeadersPolicy
         CustomErrorResponses:
           - ErrorCode: 403
             ResponseCode: 200
@@ -125,6 +126,30 @@ Resources:
           - ErrorCode: 404
             ResponseCode: 200
             ResponsePagePath: /index.html
+
+  # Security response headers (HSTS, CSP, anti-clickjacking) for the SPA.
+  SpaSecurityHeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub "${AWS::StackName}-spa-security-headers"
+        SecurityHeadersConfig:
+          StrictTransportSecurity:
+            AccessControlMaxAgeSec: 63072000
+            IncludeSubdomains: true
+            Preload: true
+            Override: true
+          ContentTypeOptions:
+            Override: true
+          FrameOptions:
+            FrameOption: DENY
+            Override: true
+          ReferrerPolicy:
+            ReferrerPolicy: no-referrer
+            Override: true
+          ContentSecurityPolicy:
+            Override: true
+            ContentSecurityPolicy: !Sub "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self' ${HttpApi.ApiEndpoint}; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
 
   SpaBucketPolicy:
     Type: AWS::S3::BucketPolicy
@@ -618,6 +643,8 @@ Resources:
           GLUE_VPC_TABLE: !Ref VpcFlowLogsTableName
           ATHENA_WORKGROUP: !Ref InvestigatorWorkGroup
           BEDROCK_MODEL_ID: !Ref BedrockModelId
+          # Pin API CORS allow-origin to the deployed CloudFront domain.
+          ALLOWED_ORIGIN: !Sub "https://${SpaDistribution.DomainName}"
           AUTH_SECRET_ARN: !Ref AuthTokenSecret
           BYTES_SCANNED_CUTOFF: !Ref BytesScannedCutoff
           ALLOWED_TIME_RANGE_MAX_DAYS: !Ref AllowedTimeRangeMaxDays
@@ -658,6 +685,10 @@ Resources:
       ApiId: !Ref HttpApi
       StageName: "$default"
       AutoDeploy: true
+      # Brute-force / abuse guard: rate-limit the public token endpoint.
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 20
+        ThrottlingRateLimit: 10
 
   ApiInvokePermission:
     Type: AWS::Lambda::Permission
