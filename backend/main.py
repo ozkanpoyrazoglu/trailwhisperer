@@ -35,8 +35,14 @@ SESSION_TABLE = os.getenv("DYNAMODB_SESSION_TABLE")
 HISTORY_TTL_SECONDS = 24 * 3600  # sessions self-expire after 24h (DynamoDB TTL)
 
 app = FastAPI(title="TrailWhisperer Orchestrator")
+# ALLOWED_ORIGIN is the deployed SPA (CloudFront) origin, injected by CloudFormation.
+# Unset/empty (local dev) falls back to "*" so docker compose keeps working.
+_allowed_origin = os.getenv("ALLOWED_ORIGIN")
 app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
+    CORSMiddleware,
+    allow_origins=[_allowed_origin] if _allowed_origin else ["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 
@@ -559,10 +565,8 @@ def validate_sql(sql: str):
 
 @app.get("/api/health")
 def health():
-    tables = [f"{GLUE_DATABASE}.{GLUE_TABLE}", f"{GLUE_DATABASE}.{GLUE_VPC_TABLE}"]
-    if GLUE_PROWLER_TABLE:
-        tables.append(f"{GLUE_DATABASE}.{GLUE_PROWLER_TABLE}")
-    return {"status": "ok", "model": MODEL_ID, "tables": tables}
+    # Intentionally minimal: a bare liveness probe that discloses nothing pre-auth.
+    return {"status": "ok"}
 
 
 @app.post("/api/generate-sql", dependencies=[Depends(require_auth)])
