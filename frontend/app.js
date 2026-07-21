@@ -153,7 +153,7 @@ function addAsk(question) {
 /* Analyst turn scaffold — a signal monogram in the left rail + content body.
    Used by the thinking status, plain-text replies, findings, and errors so
    every non-user message shares one conversational rhythm. */
-const AVATAR = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12h3l2-7 3 15 3-11 2 5h7"/></svg>`;
+const AVATAR = `<span class="avatar-mono" aria-hidden="true">TW</span>`;
 function agentTurn(inner, thinking = false) {
   return `<div class="turn agent${thinking ? " is-thinking" : ""}"><span class="avatar" aria-hidden="true">${AVATAR}</span><div class="turn-body">${inner}</div></div>`;
 }

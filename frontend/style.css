@@ -24,6 +24,9 @@
   --signal-2: #38bdf8;                      /* sky-400 — electric blue */
   --signal-dim: rgba(34, 211, 238, 0.12);
   --signal-bd: rgba(34, 211, 238, 0.35);
+  --drift-a: #22d3ee;                       /* wordmark "Hue Drift" gradient stops */
+  --drift-b: #7ce8f4;
+  --drift-c: #12a6c4;
   --amber: #fbbf24;                         /* human authorization / review */
   --amber-dim: rgba(251, 191, 36, 0.12);
   --flag: #f87171;                          /* critical */
@@ -66,6 +69,9 @@
   --signal-2: #0284c7;                      /* sky-600 — electric blue */
   --signal-dim: rgba(8, 145, 178, 0.10);
   --signal-bd: rgba(8, 145, 178, 0.30);
+  --drift-a: #0e9aa6;                       /* wordmark "Hue Drift" gradient stops */
+  --drift-b: #3bc4ce;
+  --drift-c: #0b7c86;
   --amber: #b45309;                         /* amber-700 — readable on light */
   --amber-dim: rgba(180, 83, 9, 0.10);
   --flag: #dc2626;                          /* red-600 */
@@ -127,35 +133,48 @@ body {
   border-right: 1px solid var(--line);
 }
 
-/* Brand */
+/* Brand — icon-free "Hue Drift" wordmark */
 .brand {
   display: flex;
-  align-items: center;
-  gap: 12px;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
   padding: 20px 18px;
   border-bottom: 1px solid var(--line);
 }
-.sigil {
-  display: grid;
-  place-items: center;
-  width: 38px;
-  height: 38px;
-  border-radius: 10px;
-  background: var(--signal-dim);
-  border: 1px solid var(--signal-bd);
-  color: var(--signal);
-}
-.sigil svg { width: 20px; height: 20px; }
-.brand h1 {
+.wordmark {
   margin: 0;
+  font-family: 'Sora', system-ui, sans-serif;
   font-weight: 700;
-  font-size: 16px;
-  letter-spacing: -0.01em;
-  line-height: 1.1;
+  font-size: 22px;
+  letter-spacing: -0.03em;
+  line-height: 1;
+  color: var(--text);
+  white-space: nowrap;
+}
+/* "Whisperer" — slow teal→cyan gradient drifting across the letters */
+.wordmark-drift {
+  background-image: linear-gradient(90deg, var(--drift-a), var(--drift-b), var(--drift-a), var(--drift-c));
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: tw-drift 9s linear infinite;
+}
+@keyframes tw-drift {
+  0%   { background-position: 0% 50%; }
+  100% { background-position: 200% 50%; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .wordmark-drift {
+    animation: none;
+    background: none;
+    -webkit-text-fill-color: var(--drift-a);
+    color: var(--drift-a);
+  }
 }
 .brand .kicker {
   display: block;
-  margin-top: 3px;
   font-size: 10px;
   letter-spacing: 0.16em;
   text-transform: uppercase;
@@ -505,6 +524,14 @@ body {
   margin-top: 1px;
 }
 .turn .avatar svg { width: 17px; height: 17px; }
+.turn .avatar .avatar-mono {
+  font-family: 'Sora', system-ui, sans-serif;
+  font-weight: 700;
+  font-size: 12px;
+  letter-spacing: -0.02em;
+  line-height: 1;
+  color: var(--signal);
+}
 .turn.is-thinking .avatar { animation: avatarPulse 1.7s var(--ease) infinite; }
 @keyframes avatarPulse {
   0%, 100% { box-shadow: 0 0 0 0 var(--signal-dim); border-color: var(--signal-bd); }
