@@ -344,9 +344,14 @@ Resources:
             build:
               commands:
                 - pip install prowler
-                # Prowler exits non-zero when it finds failing checks — that is a normal
-                # result here, not a build failure, so don't let it abort the build.
-                - prowler aws -M json-asff -o ./prowler-out || true
+                # Prowler exits 3 when it finds failing checks — that is a normal result
+                # here, not a build failure. Treat exit 3 as success, but let any other
+                # non-zero code (real crash/config error) abort the build.
+                - |
+                  prowler aws -M json-asff -o ./prowler-out; EXIT=$?
+                  if [ "$EXIT" -ne 0 ] && [ "$EXIT" -ne 3 ]; then
+                    echo "ERROR: prowler exited with $EXIT"; exit "$EXIT"
+                  fi
                 - |
                   set -e
                   ASFF=$(ls ./prowler-out/*.asff.json 2>/dev/null | head -1)
