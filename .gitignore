@@ -8,6 +8,9 @@ CLAUDE.md
 AGENT_CONTEXT.md
 roadmap.md
 cloudtrail-nl-investigator-tasarim.md
+AUTHENTICATION.md
+SECURITY_FINDINGS.md
+feature_memory_plan.md
 .agents/
 
 # --- Claude Code local settings ---
