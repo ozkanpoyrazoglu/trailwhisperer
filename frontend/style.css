@@ -557,6 +557,48 @@ body {
 .reply p { margin: 0; font-size: 15px; line-height: 1.65; color: var(--text); }
 .reply p + p { margin-top: 10px; }
 
+/* -------------------------- Markdown prose ---------------------------------
+   Shared typography for model-written prose (chat replies + findings summary).
+   Everything is token-driven, so light and dark themes follow automatically. */
+.reply > :first-child, .narrative > :first-child { margin-top: 0; }
+.reply > :last-child, .narrative > :last-child { margin-bottom: 0; }
+
+.reply h3, .reply h4, .reply h5, .reply h6,
+.narrative h3, .narrative h4, .narrative h5, .narrative h6 {
+  margin: 16px 0 7px;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--text);
+}
+.reply h3, .narrative h3 { font-size: 15px; }
+.reply h4, .narrative h4 { font-size: 14px; }
+
+.reply ul, .reply ol, .narrative ul, .narrative ol {
+  margin: 8px 0;
+  padding-left: 20px;
+  font-size: 15px;
+  line-height: 1.62;
+  color: var(--text);
+}
+.reply li, .narrative li { margin: 3px 0; }
+.reply li::marker, .narrative li::marker { color: var(--faint); }
+
+.reply strong, .narrative strong { font-weight: 600; color: var(--text); }
+.reply em, .narrative em { font-style: italic; color: var(--muted); }
+
+/* Inline code reads as a small machine-data badge, matching the mono voice. */
+.reply code, .narrative code {
+  padding: 1.5px 5px;
+  border-radius: 5px;
+  border: 1px solid var(--line);
+  background: var(--inset);
+  font-family: var(--font-mono);
+  font-size: 0.86em;
+  color: var(--signal);
+  word-break: break-word;
+}
+
 /* Thinking status — unboxed shimmer beside the pulsing monogram. */
 .thinking { display: flex; align-items: center; min-height: 22px; }
 .thinking .status-msg {
@@ -603,6 +645,7 @@ body {
 /* The narrative summary inside the card. */
 .narrative { padding: 0 18px 4px; }
 .narrative p { margin: 0; font-size: 15px; line-height: 1.62; color: var(--text); }
+.narrative p + p { margin-top: 9px; }
 
 /* Severity language — shape + color encode triage (info/warn/critical/clear) */
 [data-sev="info"]     { --sev: var(--signal); --sev-dim: var(--signal-dim); --sev-bd: var(--signal-bd); }
