@@ -1,0 +1,128 @@
+name: CI
+
+# Runs on every PR targeting main and on every push to main.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # --- Secret scanning -------------------------------------------------------
+  secret-scan:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          fetch-depth: 0
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7  # v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # --- Security scanning (Python + IaC) --------------------------------------
+  security-scan:
+    name: Security scan (bandit · cfn-lint · trivy)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: "3.13"
+
+      - name: Install scanners
+        run: python -m pip install --upgrade pip bandit cfn-lint
+
+      # Python security scan. Gate on high-severity findings (medium+ confidence);
+      # the dev-only mock server is excluded. Tighten --severity-level to medium later if desired.
+      - name: Bandit (Python security)
+        run: bandit -r backend -x backend/mock_server.py --severity-level high --confidence-level medium
+
+      # IaC lint of the CloudFormation template (no AWS credentials needed).
+      # Fail only on errors; pre-existing style warnings (e.g. W1020) don't block CI.
+      - name: cfn-lint (IaC lint)
+        run: cfn-lint --non-zero-exit-code error investigator-stack.yaml
+
+      # IaC misconfiguration scan (SHA-pinned action). Report-only for now: the template has
+      # pre-existing HIGH findings (e.g. AWS-0006 workgroup encryption) tracked separately in
+      # SECURITY_FINDINGS.md — they should not block this CI setup. Flip exit-code to '1' once triaged.
+      - name: Trivy config scan (IaC)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        with:
+          scan-type: config
+          scan-ref: investigator-stack.yaml
+          severity: HIGH,CRITICAL
+          exit-code: "0"
+
+  # --- Build & correctness checks --------------------------------------------
+  ci-checks:
+    name: CI checks (compile · tests · CFN validate · build)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+          pip install pytest
+
+      # 1. Python syntax verification.
+      - name: Python syntax check (py_compile)
+        run: python -m compileall -q backend
+
+      # 2. Unit tests (skips cleanly until tests are added).
+      - name: Unit tests
+        run: |
+          if ls backend/test_*.py backend/tests/test_*.py tests/test_*.py >/dev/null 2>&1; then
+            pytest -q
+          else
+            echo "No unit tests found — skipping. Add backend/test_*.py (or tests/test_*.py) to enable."
+          fi
+
+      # 3. CloudFormation template validation (needs AWS credentials).
+      #    Secrets are scoped to only the steps that use them (never job-wide env).
+      - name: Detect AWS credentials
+        id: awscreds
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        run: |
+          if [ -n "$AWS_ACCESS_KEY_ID" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Validate CloudFormation template
+        if: steps.awscreds.outputs.present == 'true'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION || 'us-east-1' }}
+        run: aws cloudformation validate-template --template-body file://investigator-stack.yaml
+
+      - name: Skip CFN validate-template (no AWS credentials)
+        if: steps.awscreds.outputs.present != 'true'
+        run: echo "AWS credentials not configured; skipping 'aws cloudformation validate-template'. cfn-lint in the security-scan job already validates the template."
+
+      # 4. Build integrity — package the orchestrator Lambda.
+      - name: Build backend Lambda package
+        run: ./scripts/build-backend.sh
