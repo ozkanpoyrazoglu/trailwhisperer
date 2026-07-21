@@ -43,6 +43,22 @@ Parameters:
     Type: String
     Default: v1
     Description: Release version = S3 key prefix under the artifact bucket (e.g. v1).
+  EnableProwlerScan:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      When "true", provision an optional Prowler security scan (CodeBuild + findings
+      bucket + Glue table) and let the orchestrator correlate Prowler findings with
+      CloudTrail / VPC Flow Logs. Trigger the CodeBuild project manually (or on a
+      schedule you add) to populate the findings bucket.
+  ProwlerFindingsTableName:
+    Type: String
+    Default: prowler_findings
+    Description: Glue table name mapping the Prowler JSON findings (used only when EnableProwlerScan=true).
+
+Conditions:
+  HasProwler: !Equals [!Ref EnableProwlerScan, "true"]
 
 Resources:
 
@@ -247,6 +263,121 @@ Resources:
             - { Name: action, Type: string }
             - { Name: log_status, Type: string }
 
+  # ---------------------------------------------------------------------------
+  # Optional Prowler security scan (EnableProwlerScan=true). A CodeBuild project
+  # runs Prowler against the account and writes JSON findings to S3; a Glue table
+  # exposes them to Athena so the orchestrator can correlate the static security
+  # posture with the dynamic CloudTrail / VPC Flow logs.
+  # ---------------------------------------------------------------------------
+  ProwlerFindingsBucket:
+    Type: AWS::S3::Bucket
+    Condition: HasProwler
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  ProwlerBuildRole:
+    Type: AWS::IAM::Role
+    Condition: HasProwler
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codebuild.amazonaws.com }
+            Action: sts:AssumeRole
+      # Prowler needs broad read/describe across the account to audit it.
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/SecurityAudit
+        - arn:aws:iam::aws:policy/job-function/ViewOnlyAccess
+      Policies:
+        - PolicyName: prowler-build
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: WriteFindings
+                Effect: Allow
+                Action: [s3:PutObject, s3:GetObject, s3:ListBucket]
+                Resource:
+                  - !GetAtt ProwlerFindingsBucket.Arn
+                  - !Sub "${ProwlerFindingsBucket.Arn}/*"
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*"
+
+  ProwlerScanProject:
+    Type: AWS::CodeBuild::Project
+    Condition: HasProwler
+    Properties:
+      Name: !Sub "${AWS::StackName}-prowler-scan"
+      Description: Runs Prowler and writes JSON (ASFF) findings to the findings bucket.
+      ServiceRole: !GetAtt ProwlerBuildRole.Arn
+      TimeoutInMinutes: 120
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        EnvironmentVariables:
+          - Name: PROWLER_BUCKET
+            Value: !Ref ProwlerFindingsBucket
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            build:
+              commands:
+                - pip install prowler
+                - prowler aws -M json-asff -B $PROWLER_BUCKET
+
+  ProwlerFindingsTable:
+    Type: AWS::Glue::Table
+    Condition: HasProwler
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: !Ref ProwlerFindingsTableName
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: json
+        # Point at the Prowler JSON output. Prowler `-B` writes under `output/` in
+        # the bucket. NOTE: the flat columns below are the schema the orchestrator
+        # prompt advertises; the exact ASFF field paths may need SerDe `mapping.*`
+        # tuning at deploy time (Phase 8 live-deploy) — Prowler's ASFF is nested.
+        StorageDescriptor:
+          Location: !Sub "s3://${ProwlerFindingsBucket}/output/"
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+            Parameters:
+              "ignore.malformed.json": "true"
+          Columns:
+            - { Name: finding_uid, Type: string }
+            - { Name: check_id, Type: string }
+            - { Name: check_title, Type: string }
+            - { Name: status, Type: string }
+            - { Name: status_extended, Type: string }
+            - { Name: severity, Type: string }
+            - { Name: service_name, Type: string }
+            - { Name: region, Type: string }
+            - { Name: resource_id, Type: string }
+            - { Name: resource_arn, Type: string }
+            - { Name: account_id, Type: string }
+
   InvestigatorWorkGroup:
     Type: AWS::Athena::WorkGroup
     Properties:
@@ -325,6 +456,10 @@ Resources:
                   - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabaseName}"
                   - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabaseName}/${GlueTableName}"
                   - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabaseName}/${VpcFlowLogsTableName}"
+                  - !If
+                    - HasProwler
+                    - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabaseName}/${ProwlerFindingsTableName}"
+                    - !Ref "AWS::NoValue"
               - Sid: SourceLogsReadOnly
                 Effect: Allow
                 Action:
@@ -356,6 +491,17 @@ Resources:
                   - dynamodb:PutItem
                   - dynamodb:UpdateItem
                 Resource: !GetAtt ChatSessionsTable.Arn
+              - !If
+                - HasProwler
+                - Sid: ProwlerFindingsReadOnly
+                  Effect: Allow
+                  Action:
+                    - s3:GetObject
+                    - s3:ListBucket
+                  Resource:
+                    - !GetAtt ProwlerFindingsBucket.Arn
+                    - !Sub "${ProwlerFindingsBucket.Arn}/*"
+                - !Ref "AWS::NoValue"
 
   OrchestratorFunction:
     Type: AWS::Lambda::Function
@@ -377,6 +523,7 @@ Resources:
           BYTES_SCANNED_CUTOFF: !Ref BytesScannedCutoff
           ALLOWED_TIME_RANGE_MAX_DAYS: !Ref AllowedTimeRangeMaxDays
           DYNAMODB_SESSION_TABLE: !Ref ChatSessionsTable
+          GLUE_PROWLER_TABLE: !If [HasProwler, !Ref ProwlerFindingsTableName, !Ref "AWS::NoValue"]
       Code:
         S3Bucket: !Sub "${ArtifactBucketPrefix}-${AWS::Region}"
         S3Key: !Sub "${ArtifactVersion}/backend.zip"
@@ -553,3 +700,10 @@ Outputs:
     Value: !Ref AuthTokenSecret
   AthenaWorkGroupName:
     Value: !Ref InvestigatorWorkGroup
+  ProwlerScanProjectName:
+    Condition: HasProwler
+    Description: Trigger this CodeBuild project to run a Prowler scan (aws codebuild start-build --project-name ...).
+    Value: !Ref ProwlerScanProject
+  ProwlerFindingsBucketName:
+    Condition: HasProwler
+    Value: !Ref ProwlerFindingsBucket

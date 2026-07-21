@@ -18,6 +18,11 @@ MODEL_ID = os.getenv("BEDROCK_MODEL_ID", "anthropic.claude-3-5-sonnet-20241022-v
 GLUE_DATABASE = os.getenv("GLUE_DATABASE", "trailwhisperer_db")
 GLUE_TABLE = os.getenv("GLUE_TABLE", "cloudtrail_logs")
 GLUE_VPC_TABLE = os.getenv("GLUE_VPC_TABLE", "vpc_flow_logs")
+# Optional Prowler findings table (only set when EnableProwlerScan=true in CFN).
+# When present, the model may query it and correlate the static security posture
+# with the time-series logs. Prowler findings are a point-in-time snapshot, so this
+# table is NOT time-partitioned and is exempt from the mandatory `dt` filter.
+GLUE_PROWLER_TABLE = os.getenv("GLUE_PROWLER_TABLE")
 ATHENA_WORKGROUP = os.getenv("ATHENA_WORKGROUP", "primary")
 # Optional. Deployed workgroups enforce their own OutputLocation, but local dev
 # against the `primary` workgroup has none — set this to write results to S3.
@@ -165,6 +170,22 @@ VPC_CRIB = (
     "dt >= date_format(current_timestamp - interval 'N' day, '%Y/%m/%d')."
 )
 
+PROWLER_CRIB = (
+    "Prowler is an AWS security scanner; each row is ONE check result (a point-in-time "
+    "posture snapshot, NOT time-series). "
+    "status: 'PASS' or 'FAIL' (a FAIL is an open security issue). "
+    "severity: 'critical' | 'high' | 'medium' | 'low' | 'informational'. "
+    "check_id: the Prowler check identifier, e.g. "
+    "'ec2_securitygroup_allow_ingress_from_internet_to_tcp_port_22' (SSH open to the internet) "
+    "or '..._to_tcp_port_3389' (RDP). Match with `=` or `LIKE`. "
+    "check_title: human-readable check description. status_extended: one-line detail of the result. "
+    "service_name: the AWS service (e.g. 'ec2', 's3', 'iam'). region: AWS region of the resource. "
+    "resource_id: the flagged resource (e.g. a security-group id like 'sg-0abc123'); "
+    "resource_arn: its full ARN. account_id: the audited account. "
+    "IMPORTANT: this table is NOT partitioned and has NO time column — do NOT add a `dt` or "
+    "event-time filter when querying it alone; filter by status/severity/check_id/service instead."
+)
+
 FEWSHOT = (
     "Q: Who changed a security group last week?\n"
     f"SQL: SELECT eventtime, useridentity.arn, eventname, sourceipaddress FROM {GLUE_TABLE} "
@@ -206,6 +227,55 @@ FEWSHOT = (
     "AND eventtime >= to_iso8601(current_timestamp - interval '7' day) ORDER BY eventtime DESC;"
 )
 
+# Prowler few-shot (appended to FEWSHOT only when GLUE_PROWLER_TABLE is set).
+# Demonstrates a plain findings query and cross-log correlation: take an open
+# security-group finding and check VPC Flow Logs for actual internet traffic.
+PROWLER_FEWSHOT = (
+    "\n\nQ: List my critical Prowler findings.\n"
+    f"SQL: SELECT check_id, check_title, severity, service_name, resource_id, region "
+    f"FROM {GLUE_PROWLER_TABLE} "
+    "WHERE status = 'FAIL' AND severity = 'critical' ORDER BY service_name;\n\n"
+    "Q: Did the open security groups flagged by Prowler receive any internet traffic?\n"
+    "SQL: SELECT 'prowler_finding' AS source, check_id AS detail, resource_id AS resource, severity AS extra "
+    f"FROM {GLUE_PROWLER_TABLE} "
+    "WHERE status = 'FAIL' "
+    "AND check_id LIKE 'ec2_securitygroup_allow_ingress_from_internet_to_tcp_port_%' "
+    "UNION ALL "
+    "SELECT 'vpc_flow' AS source, action AS detail, dstaddr AS resource, CAST(dstport AS varchar) AS extra "
+    f"FROM {GLUE_VPC_TABLE} "
+    "WHERE dt >= date_format(current_timestamp - interval '7' day, '%Y/%m/%d') "
+    "AND action = 'ACCEPT' AND dstport IN (22, 3389) "
+    "AND \"start\" >= to_unixtime(current_timestamp - interval '7' day);"
+)
+
+# Conditional Prowler grounding — only advertised when the findings table exists.
+_PROWLER_TABLE_LINE = (
+    f"- `{GLUE_PROWLER_TABLE}` — Prowler security-scan findings: static security posture "
+    "(which checks PASSed/FAILed, severity, flagged resource ids/arns). NOT time-series — do "
+    "NOT add a `dt`/time filter when querying it alone.\n"
+    if GLUE_PROWLER_TABLE else ""
+)
+_WHITELIST = f"`{GLUE_TABLE}` and/or `{GLUE_VPC_TABLE}`" + (
+    f" and/or `{GLUE_PROWLER_TABLE}`" if GLUE_PROWLER_TABLE else ""
+)
+_PROWLER_CORRELATION = (
+    "- PROWLER CORRELATION: to check whether a static Prowler finding is actually being exploited, "
+    f"`UNION ALL` a `{GLUE_PROWLER_TABLE}` branch (the finding: check_id/status='FAIL'/resource_id) "
+    f"with a `{GLUE_VPC_TABLE}` (or `{GLUE_TABLE}`) branch (the live traffic/activity). Align the "
+    "projected columns across branches. The Prowler branch has NO time/`dt` filter (it is a snapshot); "
+    "the log branch(es) STILL enforce their mandatory `dt` + event-timestamp predicates.\n"
+    if GLUE_PROWLER_TABLE else ""
+)
+_PROWLER_SCHEMA = (
+    f"\n\nPROWLER FINDINGS (`{GLUE_PROWLER_TABLE}`) COLUMNS:\n{PROWLER_CRIB}"
+    if GLUE_PROWLER_TABLE else ""
+)
+_PROWLER_EXAMPLES = PROWLER_FEWSHOT if GLUE_PROWLER_TABLE else ""
+_PROWLER_EXEMPT = (
+    " (The Prowler findings table is exempt: it is a static snapshot with no `dt`.)"
+    if GLUE_PROWLER_TABLE else ""
+)
+
 SQL_SYSTEM = (
     "You are a cloud security analyst assistant investigating AWS CloudTrail and VPC Flow "
     "Logs with an auditor. You can see the earlier turns of this conversation.\n"
@@ -216,25 +286,27 @@ SQL_SYSTEM = (
     "2) QUERY THE LOGS: if answering needs NEW data from the logs, call the `query_athena` tool "
     "with a single Athena (Trino SQL) SELECT following ALL rules below. Put the SQL ONLY in the "
     "tool's `sql` argument — never in your text reply.\n"
-    "When you query, pick exactly ONE whitelisted table for the question:\n"
+    "When you query, pick the whitelisted table(s) that fit the question:\n"
     f"- `{GLUE_TABLE}` — AWS API/management activity (who did what) from CloudTrail.\n"
     f"- `{GLUE_VPC_TABLE}` — network traffic (connections, IPs, ports, accepted/rejected flows) from VPC Flow Logs.\n"
+    f"{_PROWLER_TABLE_LINE}"
     "SQL RULES (for the `query_athena` `sql` argument):\n"
     "- The `sql` argument holds ONLY the SQL — no prose, no markdown fences.\n"
     "- Exactly one read-only SELECT. Never INSERT/UPDATE/DELETE/CREATE/DROP/ALTER/UNLOAD.\n"
-    f"- Query only the whitelisted tables (`{GLUE_TABLE}` and/or `{GLUE_VPC_TABLE}`); never any other table.\n"
+    f"- Query only the whitelisted tables ({_WHITELIST}); never any other table.\n"
     "- CROSS-LOG CORRELATION: when a question spans BOTH what someone did (API activity) AND their "
     f"network traffic — e.g. investigating a single IP address across `{GLUE_TABLE}` and `{GLUE_VPC_TABLE}` "
     "— correlate them with a `UNION ALL` of two SELECT branches (one per table). Do NOT join the tables. "
     "Both branches MUST project the SAME column count with matching types and aliases, e.g. "
     "(event_time, source, action, identity), casting/normalizing as needed so the shapes line up. "
-    "CRITICALLY, BOTH branches MUST independently enforce the mandatory `dt` partition filter AND their "
+    "CRITICALLY, each LOG branch MUST independently enforce the mandatory `dt` partition filter AND its "
     "own event-timestamp predicate (CloudTrail uses `eventtime`, VPC uses \"start\").\n"
-    "- MANDATORY PARTITION PRUNING: EVERY query MUST filter the `dt` partition key in WHERE, "
-    "using exactly this form (N = number of days in the window):\n"
+    f"{_PROWLER_CORRELATION}"
+    "- MANDATORY PARTITION PRUNING: EVERY query against a LOG table (CloudTrail / VPC Flow Logs) MUST "
+    "filter the `dt` partition key in WHERE, using exactly this form (N = number of days in the window):\n"
     "      dt >= date_format(current_timestamp - interval 'N' day, '%Y/%m/%d')\n"
-    "  `dt` is a STRING partition formatted 'yyyy/MM/dd'. A query WITHOUT a `dt` filter is REJECTED — "
-    "never emit one. This applies to BOTH tables.\n"
+    "  `dt` is a STRING partition formatted 'yyyy/MM/dd'. A LOG query WITHOUT a `dt` filter is REJECTED — "
+    f"never emit one.{_PROWLER_EXEMPT}\n"
     "- ALSO include a precise time-window predicate on the event's own timestamp. If the user gives no "
     f"range, default to the last {MAX_DAYS} days and never exceed it. Use the SAME N for `dt` and the "
     "timestamp column:\n"
@@ -248,8 +320,9 @@ SQL_SYSTEM = (
     "must both open and close with a single quote, e.g. requestparameters LIKE '%\"groupId\":%'. A "
     "pattern like '%\"groupId\":%\" is malformed and will be rejected.\n\n"
     f"CLOUDTRAIL (`{GLUE_TABLE}`) COLUMNS:\n{CRIB}\n\n"
-    f"VPC FLOW LOGS (`{GLUE_VPC_TABLE}`) COLUMNS:\n{VPC_CRIB}\n\n"
-    f"EXAMPLES:\n{FEWSHOT}"
+    f"VPC FLOW LOGS (`{GLUE_VPC_TABLE}`) COLUMNS:\n{VPC_CRIB}"
+    f"{_PROWLER_SCHEMA}\n\n"
+    f"EXAMPLES:\n{FEWSHOT}{_PROWLER_EXAMPLES}"
 )
 
 SUMMARY_SYSTEM = (
@@ -446,23 +519,28 @@ def validate_sql(sql: str):
         return False, "only read-only SELECT statements are allowed"
     if not isinstance(stmt, (exp.Select, exp.Union)):
         return False, "query must be a SELECT"
-    allowed = {GLUE_TABLE.lower(), GLUE_VPC_TABLE.lower()}
+    # Time-partitioned LOG tables require the mandatory `dt` filter; the optional
+    # Prowler findings table is a static snapshot (no partitions), so it is
+    # whitelisted for scanning but exempt from the `dt` requirement.
+    time_partitioned = {GLUE_TABLE.lower(), GLUE_VPC_TABLE.lower()}
+    allowed = set(time_partitioned)
+    if GLUE_PROWLER_TABLE:
+        allowed.add(GLUE_PROWLER_TABLE.lower())
     tables = {t.name.lower() for t in stmt.find_all(exp.Table) if t.name}
-    if tables - allowed:
-        return False, f"only tables `{GLUE_TABLE}` or `{GLUE_VPC_TABLE}` may be queried"
-    wheres = list(stmt.find_all(exp.Where))
-    if not wheres:
-        return False, "a time-window filter is required"
-
-    # Partition pruning is non-negotiable: EVERY select that scans a whitelisted
-    # table must itself bind the `dt` partition key (yyyy/MM/dd, shared by both
-    # tables). Checking mere presence of the column name is not enough — it lets
-    # OR branches, non-range predicates (IS NOT NULL/LIKE), subquery-only filters
-    # and unpruned UNION branches through. We require a binding predicate in the
-    # AND context of each scanning select's own WHERE.
-    scanning = [s for s in stmt.find_all(exp.Select) if _own_tables(s) & allowed]
-    if not scanning:
+    if not tables:
         return False, "query must scan a whitelisted table"
+    if tables - allowed:
+        allowed_list = "`, `".join(sorted(allowed))
+        return False, f"only tables `{allowed_list}` may be queried"
+
+    # Partition pruning is non-negotiable for the LOG tables: EVERY select that
+    # scans a time-partitioned table must itself bind the `dt` partition key
+    # (yyyy/MM/dd). Checking mere presence of the column name is not enough — it
+    # lets OR branches, non-range predicates (IS NOT NULL/LIKE), subquery-only
+    # filters and unpruned UNION branches through. We require a binding predicate
+    # in the AND context of each scanning select's own WHERE. Prowler-only selects
+    # are skipped (no partitions / no time column).
+    scanning = [s for s in stmt.find_all(exp.Select) if _own_tables(s) & time_partitioned]
     for s in scanning:
         if not _has_binding_dt(s):
             return False, (
@@ -481,11 +559,10 @@ def validate_sql(sql: str):
 
 @app.get("/api/health")
 def health():
-    return {
-        "status": "ok",
-        "model": MODEL_ID,
-        "tables": [f"{GLUE_DATABASE}.{GLUE_TABLE}", f"{GLUE_DATABASE}.{GLUE_VPC_TABLE}"],
-    }
+    tables = [f"{GLUE_DATABASE}.{GLUE_TABLE}", f"{GLUE_DATABASE}.{GLUE_VPC_TABLE}"]
+    if GLUE_PROWLER_TABLE:
+        tables.append(f"{GLUE_DATABASE}.{GLUE_PROWLER_TABLE}")
+    return {"status": "ok", "model": MODEL_ID, "tables": tables}
 
 
 @app.post("/api/generate-sql", dependencies=[Depends(require_auth)])

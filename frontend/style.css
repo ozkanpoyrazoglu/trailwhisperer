@@ -1033,6 +1033,7 @@ tbody tr[data-sev="critical"] td { background: var(--flag-dim); }
 }
 .sample-dot.ct { background: var(--signal); box-shadow: 0 0 0 3px var(--signal-dim); }
 .sample-dot.vpc { background: var(--signal-2); box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.12); }
+.sample-dot.prowler { background: var(--amber); box-shadow: 0 0 0 3px var(--amber-dim); }
 
 .sample-q {
   text-align: left;

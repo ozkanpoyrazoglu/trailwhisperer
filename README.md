@@ -25,6 +25,7 @@ If an Athena query fails, the error and the bad SQL are fed back to the model to
 - **Incident response & forensic auditing** without learning Athena SQL or the CloudTrail JSON schema.
 - **Security investigations** across two log sources — CloudTrail (*who did what*) and VPC Flow Logs (*network traffic*) — including **cross-log correlation** (e.g. "did this IP make API calls *and* network connections?") via `UNION ALL`.
 - **Inspecting complex nested JSON** such as security-group `ipPermissions` to catch things like SSH/RDP opened to `0.0.0.0/0`.
+- **Correlating static security posture with live activity** — an optional [Prowler scan](#optional-prowler-security-scan) exposes findings (open security groups, failing checks) as a third queryable table, so you can ask *"list my critical Prowler findings"* or line an open-SG finding up against actual VPC traffic on the same port.
 - **Ad-hoc, on-demand auditing** where standing up a full SIEM is overkill — spin it up, investigate, tear it down.
 
 ## Architecture
@@ -48,7 +49,7 @@ API Gateway (HTTP API)  →  Lambda (FastAPI + Mangum, Python 3.13)
 
 - **Read-only, `SELECT`-only** — enforced by SQL parsing, against a table whitelist.
 - **Human-in-the-loop** — generated SQL is always shown and requires explicit approval; never auto-executed silently.
-- **Mandatory partition/time filter** — every query must prune on `dt` and bound its time window (capped by `AllowedTimeRangeMaxDays`).
+- **Mandatory partition/time filter** — every query against a **log table** must prune on `dt` and bound its time window (capped by `AllowedTimeRangeMaxDays`). The optional Prowler findings table is exempt (it's a static snapshot, not time-partitioned).
 - **Grounding over hallucination** — summaries derive strictly from returned rows.
 - **Least-privilege IAM** — Bedrock scoped to the chosen model, Athena to the workgroup, Glue to the DB/tables, S3 read-only on the log buckets.
 
@@ -114,6 +115,8 @@ aws cloudformation deploy \
 | `BedrockModelId` | `anthropic.claude-3-5-sonnet-20241022-v2:0` | Bedrock model for NL→SQL and summarization. |
 | `BytesScannedCutoff` | `1073741824` (1 GB) | Per-query bytes-scanned cap (runaway-cost guard). |
 | `AllowedTimeRangeMaxDays` | `90` | Max time window (days) the orchestrator allows per query. |
+| `EnableProwlerScan` | `false` | When `true`, provision the optional [Prowler security scan](#optional-prowler-security-scan) (CodeBuild + findings bucket + Glue table) and expose findings to the orchestrator. |
+| `ProwlerFindingsTableName` | `prowler_findings` | Glue table mapping the Prowler JSON findings (used only when `EnableProwlerScan=true`). |
 
 The stack creates: the Athena results bucket (7-day lifecycle) and SPA bucket, a CloudFront distribution (Origin Access Control), the Athena Workgroup with the bytes-scanned cutoff, the Glue database + two partition-projected tables, the auth-token secret (auto-generated), the orchestrator Lambda (code from the release bucket) + HTTP API, a least-privilege IAM role, and the SPA-deployer custom resource that publishes the frontend + `config.js`.
 
@@ -135,7 +138,31 @@ aws secretsmanager get-secret-value \
 
 Open `UiUrl`, paste the token into the login modal (stored in `localStorage`, sent as `Authorization: Bearer <token>`). The API endpoint is already wired via `config.js` — nothing else to configure.
 
-Other outputs: `ApiUrl` (HTTP API endpoint), `SpaBucketName`, `AthenaWorkGroupName`.
+Other outputs: `ApiUrl` (HTTP API endpoint), `SpaBucketName`, `AthenaWorkGroupName`. When `EnableProwlerScan=true`, also `ProwlerScanProjectName` (the CodeBuild project to trigger) and `ProwlerFindingsBucketName`.
+
+---
+
+## Optional Prowler security scan
+
+Setting `EnableProwlerScan=true` provisions an optional [Prowler](https://github.com/prowler-cloud/prowler) scan so you can query your static security posture alongside the logs. It adds (only when enabled):
+
+- a **CodeBuild project** that runs `prowler aws -M json-asff -B <bucket>` (its role uses the AWS-managed `SecurityAudit` + `ViewOnlyAccess` policies — read-only, account-wide),
+- a **findings S3 bucket** for the JSON output, and
+- a **Glue table** (default `prowler_findings`) exposing the findings to Athena.
+
+The orchestrator's prompt and guardrail learn the new table automatically (via the `GLUE_PROWLER_TABLE` env var): it is whitelisted for `SELECT`, but — because Prowler findings are a **point-in-time snapshot, not time-series** — it is **exempt from the mandatory `dt` partition filter** the log tables require.
+
+**Running a scan.** The scan is **not** scheduled by default — trigger it manually (or add your own EventBridge rule). CodeBuild runs the scan and writes findings to the bucket; a full account scan can take ~15–45 min:
+
+```bash
+aws codebuild start-build --project-name <ProwlerScanProjectName-from-outputs>
+```
+
+Once findings land, ask things like *"List my critical Prowler findings"* or *"Which high-severity Prowler checks are failing?"* (sample chips for these are in the console's query library).
+
+> **Correlation caveat — honest scope.** You can also ask *"did the open security groups flagged by Prowler receive any internet traffic?"*, which `UNION ALL`s the finding with VPC Flow Logs. This is a **heuristic, side-by-side correlation by port / internet-facing traffic — not a precise per-security-group join.** VPC Flow Logs record ENIs and IPs and carry **no security-group id**, so there is no key to tie a *specific* `sg-…` to specific flows. Treat it as a triage aid, not proof.
+
+> **Deploy tuning.** The Glue table advertises flat columns (`status`, `severity`, `check_id`, `resource_id`, …); Prowler's ASFF output is nested, so the SerDe field mapping and storage location may need adjusting against a real scan before Athena reads it cleanly (tracked under roadmap Phase 8 / Phase 19).
 
 ---
 
