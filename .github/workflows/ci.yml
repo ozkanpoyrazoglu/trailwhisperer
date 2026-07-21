@@ -1,0 +1,113 @@
+name: CI
+
+# Runs on every PR targeting main and on every push to main.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # --- Secret scanning -------------------------------------------------------
+  secret-scan:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # --- Security scanning (Python + IaC) --------------------------------------
+  security-scan:
+    name: Security scan (bandit · cfn-lint · trivy)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install scanners
+        run: python -m pip install --upgrade pip bandit cfn-lint
+
+      # Python security scan. Gate on high-severity findings (medium+ confidence);
+      # the dev-only mock server is excluded. Tighten --severity-level to medium later if desired.
+      - name: Bandit (Python security)
+        run: bandit -r backend -x backend/mock_server.py --severity-level high --confidence-level medium
+
+      # IaC lint of the CloudFormation template (no AWS credentials needed).
+      - name: cfn-lint (IaC lint)
+        run: cfn-lint investigator-stack.yaml
+
+      # IaC misconfiguration scan via Trivy (installed from the official script to avoid action-version drift).
+      - name: Install Trivy
+        run: curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+
+      - name: Trivy config scan (IaC)
+        run: trivy config --severity HIGH,CRITICAL --exit-code 1 investigator-stack.yaml
+
+  # --- Build & correctness checks --------------------------------------------
+  ci-checks:
+    name: CI checks (compile · tests · CFN validate · build)
+    runs-on: ubuntu-latest
+    env:
+      # Present only if configured as repo secrets; used to gate the AWS-dependent step.
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION || 'us-east-1' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+          pip install pytest
+
+      # 1. Python syntax verification.
+      - name: Python syntax check (py_compile)
+        run: python -m compileall -q backend
+
+      # 2. Unit tests (skips cleanly until tests are added).
+      - name: Unit tests
+        run: |
+          if ls backend/test_*.py backend/tests/test_*.py tests/test_*.py >/dev/null 2>&1; then
+            pytest -q
+          else
+            echo "No unit tests found — skipping. Add backend/test_*.py (or tests/test_*.py) to enable."
+          fi
+
+      # 3. CloudFormation template validation (needs AWS credentials; skipped if absent —
+      #    cfn-lint in security-scan already validates the template unconditionally).
+      - name: Validate CloudFormation template
+        if: ${{ env.AWS_ACCESS_KEY_ID != '' }}
+        run: aws cloudformation validate-template --template-body file://investigator-stack.yaml
+
+      - name: Skip CFN validate-template (no AWS credentials)
+        if: ${{ env.AWS_ACCESS_KEY_ID == '' }}
+        run: echo "AWS credentials not configured; skipping 'aws cloudformation validate-template'. cfn-lint in the security-scan job already validates the template."
+
+      # 4. Build integrity — package the orchestrator Lambda.
+      - name: Build backend Lambda package
+        run: ./scripts/build-backend.sh
