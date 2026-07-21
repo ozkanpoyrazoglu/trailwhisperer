@@ -587,6 +587,17 @@ body {
 .reply strong, .narrative strong { font-weight: 600; color: var(--text); }
 .reply em, .narrative em { font-style: italic; color: var(--muted); }
 
+/* Fenced code block — a machine-data well; scrolls sideways instead of
+   forcing the whole turn to wrap. */
+.reply pre, .narrative pre {
+  margin: 10px 0;
+  padding: 11px 13px;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+  background: var(--inset);
+  overflow-x: auto;
+}
+
 /* Inline code reads as a small machine-data badge, matching the mono voice. */
 .reply code, .narrative code {
   padding: 1.5px 5px;
@@ -597,6 +608,17 @@ body {
   font-size: 0.86em;
   color: var(--signal);
   word-break: break-word;
+}
+
+/* Inside a fence the <pre> already carries the well, so the badge treatment
+   is reset — the code keeps its own line breaks and the body text color. */
+.reply pre code, .narrative pre code {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  white-space: pre;
+  word-break: normal;
 }
 
 /* Thinking status — unboxed shimmer beside the pulsing monogram. */
