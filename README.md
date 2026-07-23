@@ -1,6 +1,14 @@
-# TrailWhisperer
+<p align="center">
+  <img src="docs/banner.svg" alt="TrailWhisperer — natural-language forensic auditing for AWS CloudTrail & VPC Flow Logs" width="840">
+</p>
 
-**Natural-language forensic auditing for AWS CloudTrail & VPC Flow Logs.**
+<p align="center">
+  <a href="deploy/README.md"><img alt="Serverless · ~$0 idle" src="https://img.shields.io/badge/serverless-~%240%20idle-22d3ee?style=flat-square&labelColor=0f2534"></a>
+  <img alt="Python 3.13" src="https://img.shields.io/badge/python-3.13-22d3ee?style=flat-square&labelColor=0f2534&logo=python&logoColor=white">
+  <img alt="FastAPI + Mangum" src="https://img.shields.io/badge/FastAPI-+%20Mangum-38bdf8?style=flat-square&labelColor=0f2534&logo=fastapi&logoColor=white">
+  <img alt="Amazon Bedrock (Claude)" src="https://img.shields.io/badge/Amazon%20Bedrock-Claude-fbbf24?style=flat-square&labelColor=0f2534&logo=amazonaws&logoColor=white">
+  <img alt="Read-only · SELECT-only" src="https://img.shields.io/badge/queries-read--only%20%C2%B7%20SELECT--only-34d399?style=flat-square&labelColor=0f2534">
+</p>
 
 Ask *"Who changed the security group last week?"* or *"Show me rejected SSH connections to internal hosts yesterday."* TrailWhisperer translates the question into Athena SQL with Amazon Bedrock (Claude), shows you the query for approval, runs it, and summarizes the returned rows into a plain-language narrative with security flags.
 
@@ -9,6 +17,28 @@ It is **serverless, ephemeral, and low-cost**: there is no always-on compute. De
 ---
 
 ## What it does (step by step)
+
+```mermaid
+flowchart TD
+    Q["🗣️ NL question<br/><i>“Who changed the security group last week?”</i>"] --> GR["Grounding<br/>Glue schema + field crib-sheet + few-shots"]
+    GR --> GEN["Bedrock NL→SQL"]
+    GEN --> VAL{"Guardrail<br/>single SELECT? whitelisted table?<br/>dt filter + bounded window?"}
+    VAL -->|reject| GEN
+    VAL -->|pass| HUM{{"🧑‍⚖️ Human approval<br/>Approve · Edit · Cancel"}}
+    HUM -->|approve| EX["Athena execution<br/>bytes-scanned cutoff"]
+    EX -->|"FAILED (≤2 rounds)"| SC["Self-correct<br/>feed error + bad SQL back"]
+    SC --> GEN
+    EX -->|rows| SUM["Grounded summary<br/>+ severity flags · info / review / critical"]
+
+    classDef machine fill:#0f2534,stroke:#22d3ee,stroke-width:1.5px,color:#e2e8f0;
+    classDef guard fill:#0f2534,stroke:#22d3ee,stroke-width:1.5px,color:#e2e8f0,stroke-dasharray:5 3;
+    classDef human fill:#2a1e05,stroke:#fbbf24,stroke-width:2px,color:#fbe8c0;
+    classDef ok fill:#0a1f18,stroke:#34d399,stroke-width:1.5px,color:#d1fae5;
+    class Q,GR,GEN,EX,SC machine;
+    class VAL guard;
+    class HUM human;
+    class SUM ok;
+```
 
 1. **You ask a question in natural language** in the web console (optionally scoping it with a time range or model choice).
 2. **Grounded NL → SQL.** The backend sends your question to Amazon Bedrock along with the Glue table schema, a CloudTrail/VPC field crib-sheet, and few-shot examples. Bedrock returns Athena (Trino-dialect) SQL.
@@ -30,14 +60,22 @@ If an Athena query fails, the error and the bad SQL are fed back to the model to
 
 ## Architecture
 
-```
-Static SPA (S3 + CloudFront)
-        │
-        ▼
-API Gateway (HTTP API)  →  Lambda (FastAPI + Mangum, Python 3.13)
-                               ├─ bedrock:InvokeModel      → Bedrock (Claude): NL→SQL + summarize
-                               ├─ athena:StartQueryExecution → Athena Workgroup → Glue Catalog → S3 logs (read-only)
-                               └─ returns generated SQL + summary → SPA
+```mermaid
+flowchart LR
+    U([You]) --> SPA["Static SPA<br/>S3 + CloudFront"]
+    SPA <-->|bearer token| API["API Gateway<br/>HTTP API"]
+    API --> L["Lambda<br/>FastAPI + Mangum · Py 3.13"]
+    L -->|"bedrock:InvokeModel"| B["Bedrock · Claude<br/>NL→SQL + summarize"]
+    L -->|"athena:StartQueryExecution"| A["Athena Workgroup<br/>bytes-scanned cutoff"]
+    A --> G["Glue Catalog<br/>partition projection"]
+    G --> S3[("S3 · CloudTrail / VPC logs<br/>read-only")]
+
+    classDef machine fill:#0f2534,stroke:#22d3ee,stroke-width:1.5px,color:#e2e8f0;
+    classDef model fill:#0f2534,stroke:#fbbf24,stroke-width:1.5px,color:#fbe8c0;
+    classDef data fill:#0a0f1d,stroke:#334155,stroke-width:1.5px,color:#cbd5e1;
+    class U,SPA,API,L,A machine;
+    class B model;
+    class G,S3 data;
 ```
 
 - **Frontend:** Vanilla JS / HTML / CSS SPA — no build step, hosted on S3 behind CloudFront.
