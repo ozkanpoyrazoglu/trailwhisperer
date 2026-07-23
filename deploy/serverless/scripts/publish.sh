@@ -23,10 +23,24 @@ VERSION="${1:?usage: publish.sh <version> <region> [region ...]}"; shift
 PREFIX="${ARTIFACT_BUCKET_PREFIX:-trailwhisperer-artifacts}"
 PUBLIC="${PUBLIC:-0}"
 
+# S3 bucket names are GLOBAL, so a plain "<prefix>-<region>" can already be taken
+# by another account. Append a uniqueness component to the prefix. Default: this
+# AWS account id — it is unique per account and STABLE across re-publishes, so the
+# same bucket is reused instead of a new one accumulating on every run (a raw
+# timestamp would orphan the previous bucket + Launch URL each time). Override with
+# ARTIFACT_BUCKET_SUFFIX=... (e.g. a timestamp) if you prefer.
+SUFFIX="${ARTIFACT_BUCKET_SUFFIX:-$(aws sts get-caller-identity --query Account --output text)}"
+[ -n "$SUFFIX" ] || { echo "error: could not resolve a bucket suffix (AWS account id)" >&2; exit 1; }
+# This is the value to pass as the ArtifactBucketPrefix stack parameter; the actual
+# bucket per region is "${FULL_PREFIX}-<region>" (matching the template's Sub).
+FULL_PREFIX="${PREFIX}-${SUFFIX}"
+
 "$(dirname "$0")/build-backend.sh"
 
+echo "== artifact bucket prefix: ${FULL_PREFIX} (pass as ArtifactBucketPrefix for CLI deploys) =="
+
 for region in "$@"; do
-  bucket="${PREFIX}-${region}"
+  bucket="${FULL_PREFIX}-${region}"
   echo "== publishing $VERSION to s3://$bucket ($region) =="
 
   if ! aws s3api head-bucket --bucket "$bucket" 2>/dev/null; then
@@ -55,7 +69,9 @@ for region in "$@"; do
   aws s3 sync "$ROOT/frontend/"               "s3://$bucket/$VERSION/frontend/" --delete >/dev/null
 
   url="https://${bucket}.s3.${region}.amazonaws.com/${VERSION}/stack.yaml"
-  launch="https://${region}.console.aws.amazon.com/cloudformation/home?region=${region}#/stacks/create/review?templateURL=${url}&stackName=ct-nl-investigator&param_ArtifactVersion=${VERSION}"
+  # Pass ArtifactBucketPrefix so the deployed stack fetches from THIS unique bucket
+  # (its template default no longer matches once a uniqueness suffix is applied).
+  launch="https://${region}.console.aws.amazon.com/cloudformation/home?region=${region}#/stacks/create/review?templateURL=${url}&stackName=ct-nl-investigator&param_ArtifactVersion=${VERSION}&param_ArtifactBucketPrefix=${FULL_PREFIX}"
   echo "   done. Launch Stack URL ($region):"
   echo "   $launch"
 done
