@@ -1,8 +1,10 @@
 import functools
 import hmac
 import json
+import logging
 import os
 import time
+from datetime import datetime, timedelta, timezone
 
 import boto3
 import sqlglot
@@ -12,6 +14,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from mangum import Mangum
 from pydantic import BaseModel, Field
 from sqlglot import exp
+
+logger = logging.getLogger("trailwhisperer")
 
 REGION = os.getenv("AWS_REGION", "us-east-1")
 MODEL_ID = os.getenv("BEDROCK_MODEL_ID", "global.anthropic.claude-sonnet-4-6")
@@ -27,9 +31,16 @@ ATHENA_WORKGROUP = os.getenv("ATHENA_WORKGROUP", "primary")
 # Optional. Deployed workgroups enforce their own OutputLocation, but local dev
 # against the `primary` workgroup has none — set this to write results to S3.
 ATHENA_OUTPUT_LOCATION = os.getenv("ATHENA_OUTPUT_LOCATION")
+# Client-side runaway-scan guard. Deployed workgroups also enforce this at the
+# service level (BytesScannedCutoffPerQuery), but local/VM dev often runs against
+# the `primary` workgroup which has no cutoff — so we additionally stop a running
+# query here once its scanned bytes exceed the limit. 0/unset disables the guard.
+BYTES_SCANNED_CUTOFF = int(os.getenv("BYTES_SCANNED_CUTOFF", "0") or "0")
 MAX_DAYS = int(os.getenv("ALLOWED_TIME_RANGE_MAX_DAYS", "90"))
 MAX_ROWS = 1000
 SUMMARY_ROWS = 200
+# Per-execution Bedrock summary cache so repeat result polls don't re-summarize (L2).
+_SUMMARY_CACHE: dict[str, tuple] = {}
 # Conversational memory (DynamoDB). Optional: unset locally → memory disabled.
 SESSION_TABLE = os.getenv("DYNAMODB_SESSION_TABLE")
 HISTORY_TTL_SECONDS = 24 * 3600  # sessions self-expire after 24h (DynamoDB TTL)
@@ -115,20 +126,33 @@ def to_converse_messages(history: list[dict]) -> list[dict]:
     return msgs
 
 
-@functools.lru_cache(maxsize=1)
+# Short-TTL cache for the Secrets Manager token. A warm Lambda/container must NOT
+# cache the token for its whole lifetime (M4): after a secret rotation a warm
+# container would keep accepting the stale token and reject the new one until a
+# cold start. A 300s TTL bounds that window while still avoiding a Secrets Manager
+# call on every request. The env-var token (local dev) never rotates.
+_AUTH_TTL_SECONDS = 300
+_auth_cache: dict = {"token": None, "expires": 0.0}
+
+
 def auth_token():
     token = os.getenv("AUTH_TOKEN")
     if token:
         return token
+    if _auth_cache["expires"] > time.time():
+        return _auth_cache["token"]
     arn = os.getenv("AUTH_SECRET_ARN")
+    resolved = None
     if arn:
         sm = boto3.client("secretsmanager", region_name=REGION)
         raw = sm.get_secret_value(SecretId=arn)["SecretString"]
         try:
-            return json.loads(raw)["token"]
+            resolved = json.loads(raw)["token"]
         except (ValueError, KeyError):
-            return raw
-    return None
+            resolved = raw
+    _auth_cache["token"] = resolved
+    _auth_cache["expires"] = time.time() + _AUTH_TTL_SECONDS
+    return resolved
 
 
 def require_auth(authorization: str = Header(default="")):
@@ -405,7 +429,10 @@ def _converse(system: str, messages: list[dict], tool_config: dict | None = None
     try:
         return _bedrock().converse(**kwargs)
     except ClientError as e:
-        raise HTTPException(502, f"bedrock error: {e.response['Error'].get('Message', str(e))}")
+        # Don't echo the raw provider message to the client (M2): it can leak
+        # model/region/config detail. Log it server-side, return a generic error.
+        logger.warning("bedrock converse failed: %s", e.response["Error"].get("Message", str(e)))
+        raise HTTPException(502, "the language model request failed")
 
 
 def _invoke(system: str, user: str, max_tokens: int = 1024, model_id: str | None = None) -> str:
@@ -491,6 +518,34 @@ def _has_binding_dt(select: exp.Select) -> bool:
     return False
 
 
+def _dt_literal_bounds_ok(select: exp.Select) -> bool:
+    """Reject binding `dt` predicates whose bound is a STRING LITERAL ('yyyy/MM/dd')
+    older than MAX_DAYS ago (H1). The interval-based cap (`_window_within_cap`)
+    only catches dynamic `current_timestamp - interval 'N' day` windows; a
+    hand-edited literal bound like `dt >= '2000/01/01'` would otherwise slip past
+    it and full-scan far beyond the allowed window."""
+    where = select.args.get("where")
+    if not where:
+        return True
+    earliest = (datetime.now(timezone.utc) - timedelta(days=MAX_DAYS)).date()
+    for cmp in where.find_all(*_DT_BINDING):
+        if cmp.find_ancestor(exp.Select) is not select or _under_or(cmp, where):
+            continue
+        if not any(c.name.lower() == "dt" and c.find_ancestor(exp.Select) is select
+                   for c in cmp.find_all(exp.Column)):
+            continue
+        for lit in cmp.find_all(exp.Literal):
+            if not lit.is_string:
+                continue
+            try:
+                d = datetime.strptime(lit.this, "%Y/%m/%d").date()
+            except ValueError:
+                continue  # not a dt-format literal (e.g. an interval count) — ignore
+            if d < earliest:
+                return False
+    return True
+
+
 def _window_within_cap(stmt: exp.Expression) -> bool:
     """Reject `interval 'N' <unit>` windows longer than MAX_DAYS."""
     for iv in stmt.find_all(exp.Interval):
@@ -532,12 +587,23 @@ def validate_sql(sql: str):
     allowed = set(time_partitioned)
     if GLUE_PROWLER_TABLE:
         allowed.add(GLUE_PROWLER_TABLE.lower())
-    tables = {t.name.lower() for t in stmt.find_all(exp.Table) if t.name}
+    # CTE names are local aliases, not real tables — a valid read-only CTE like
+    # `WITH x AS (SELECT ... FROM cloudtrail_logs) SELECT * FROM x` surfaces `x`
+    # as an exp.Table. Exclude CTE names before diffing against the whitelist (M1).
+    cte_names = {c.alias_or_name.lower() for c in stmt.find_all(exp.CTE) if c.alias_or_name}
+    real_tables = [t for t in stmt.find_all(exp.Table) if t.name and t.name.lower() not in cte_names]
+    tables = {t.name.lower() for t in real_tables}
     if not tables:
         return False, "query must scan a whitelisted table"
     if tables - allowed:
         allowed_list = "`, `".join(sorted(allowed))
         return False, f"only tables `{allowed_list}` may be queried"
+    # A whitelisted bare name in another database (`otherdb.cloudtrail_logs`) must
+    # not slip through on name alone (M1). IAM `glue:GetTable` scoping is the real
+    # backstop, but reject a mismatched DB qualifier here too.
+    for t in real_tables:
+        if t.db and t.db.lower() != GLUE_DATABASE.lower():
+            return False, "cross-database table references are not allowed"
 
     # Partition pruning is non-negotiable for the LOG tables: EVERY select that
     # scans a time-partitioned table must itself bind the `dt` partition key
@@ -554,6 +620,8 @@ def validate_sql(sql: str):
                 "in AND context (not under OR, not only in a subquery), e.g. "
                 "dt >= date_format(current_timestamp - interval 'N' day, '%Y/%m/%d')"
             )
+        if not _dt_literal_bounds_ok(s):
+            return False, f"the `dt` window reaches further back than the {MAX_DAYS}-day maximum"
 
     # Enforce the configured maximum time window (partition pruning alone doesn't
     # cap how far back the window reaches).
@@ -643,7 +711,8 @@ def execute_sql(req: ExecuteRequest):
     try:
         resp = _athena().start_query_execution(**params)
     except ClientError as e:
-        raise HTTPException(502, f"athena error: {e.response['Error'].get('Message', str(e))}")
+        logger.warning("athena start_query_execution failed: %s", e.response["Error"].get("Message", str(e)))
+        raise HTTPException(502, "failed to start the query")
     return {"execution_id": resp["QueryExecutionId"]}
 
 
@@ -696,29 +765,59 @@ def get_results(execution_id: str = Path(min_length=8), question: str = "",
     try:
         info = _athena().get_query_execution(QueryExecutionId=execution_id)["QueryExecution"]
     except ClientError as e:
-        raise HTTPException(502, f"athena error: {e.response['Error'].get('Message', str(e))}")
+        logger.warning("athena get_query_execution failed: %s", e.response["Error"].get("Message", str(e)))
+        raise HTTPException(502, "failed to fetch query status")
 
     state = info["Status"]["State"]
     scanned = info.get("Statistics", {}).get("DataScannedInBytes")
 
     if state in ("QUEUED", "RUNNING"):
+        # Client-side runaway-scan guard (H3): stop a still-running query once its
+        # scanned bytes pass the cutoff. Deployed workgroups enforce this at the
+        # service level, but a local `primary` workgroup has no cutoff.
+        if BYTES_SCANNED_CUTOFF and scanned and scanned > BYTES_SCANNED_CUTOFF:
+            try:
+                _athena().stop_query_execution(QueryExecutionId=execution_id)
+            except ClientError as e:
+                logger.warning("athena stop_query_execution failed: %s", e)
+            return {"status": "failed", "state": "CANCELLED",
+                    "error": "query exceeded the configured scan limit and was stopped",
+                    "bytes_scanned": scanned}
         return {"status": "running", "state": state}
     if state in ("FAILED", "CANCELLED"):
-        reason = info["Status"].get("StateChangeReason", "query did not succeed")
-        return {"status": "failed", "state": state, "error": reason, "bytes_scanned": scanned}
+        # Don't echo Athena's raw StateChangeReason to the client (M2) — it can
+        # leak schema/column names. Log it, return a generic failure.
+        logger.info("athena query %s %s: %s", execution_id, state,
+                    info["Status"].get("StateChangeReason", ""))
+        return {"status": "failed", "state": state,
+                "error": "the query did not complete successfully", "bytes_scanned": scanned}
 
     columns, rows = _fetch_rows(execution_id)
-    summary, flags = _summarize(question, rows, model_id or None) if rows else ("No matching events were found.", [])
 
-    # Append the result to conversation memory so follow-up questions can reason
-    # over what was actually returned (a compact assistant turn, not raw rows).
-    if session_id:
-        mem = f"Results for the question: {question}\nSummary: {summary}"
-        if flags:
-            mem += "\nFlags: " + "; ".join(str(f) for f in flags)
-        if rows:
-            mem += "\nSample rows (JSON): " + json.dumps(rows[:20], default=str)[:4000]
-        history_append(session_id, "assistant", mem)
+    # Cache the (expensive) Bedrock summary per execution_id (L2): the SPA polls
+    # this endpoint and any repeat GET for a SUCCEEDED query would otherwise
+    # re-invoke Bedrock. Cache the summary/flags, not the rows (re-fetching rows
+    # from Athena is free). Conversation memory is written only on the first
+    # summarization so repeat polls don't duplicate the turn.
+    if not rows:
+        summary, flags = ("No matching events were found.", [])
+    elif execution_id in _SUMMARY_CACHE:
+        summary, flags = _SUMMARY_CACHE[execution_id]
+    else:
+        summary, flags = _summarize(question, rows, model_id or None)
+        if len(_SUMMARY_CACHE) >= 512:  # bound growth in a long-lived container
+            _SUMMARY_CACHE.clear()
+        _SUMMARY_CACHE[execution_id] = (summary, flags)
+
+        # Append the result to conversation memory so follow-up questions can reason
+        # over what was actually returned (a compact assistant turn, not raw rows).
+        if session_id:
+            mem = f"Results for the question: {question}\nSummary: {summary}"
+            if flags:
+                mem += "\nFlags: " + "; ".join(str(f) for f in flags)
+            if rows:
+                mem += "\nSample rows (JSON): " + json.dumps(rows[:20], default=str)[:4000]
+            history_append(session_id, "assistant", mem)
 
     return {
         "status": "succeeded",
