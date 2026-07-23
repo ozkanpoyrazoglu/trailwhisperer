@@ -39,9 +39,12 @@ Parameters:
     Type: String
     Default: trailwhisperer-artifacts
     Description: >
-      Prefix of the public release bucket holding the packaged backend + frontend.
-      The actual bucket is "<prefix>-<region>" (must exist in THIS region — Lambda
-      code buckets are region-local). Published via scripts/publish.sh.
+      Prefix of the release bucket holding the packaged backend + frontend. The
+      actual bucket is "<prefix>-<region>" (must exist in THIS region — Lambda code
+      buckets are region-local). scripts/publish.sh appends a uniqueness suffix (by
+      default the AWS account id) to avoid global S3 name collisions, so the real
+      prefix is usually "trailwhisperer-artifacts-<account-id>". Use the exact
+      prefix printed by publish.sh (the one-click Launch URL sets this for you).
   ArtifactVersion:
     Type: String
     Default: v1

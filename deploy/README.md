@@ -51,8 +51,13 @@ aws cloudformation deploy \
     CloudTrailLogBucketName=my-org-cloudtrail-logs \
     VpcFlowLogsBucketName=my-org-vpc-flow-logs \
     ArtifactVersion=v1 \
+    ArtifactBucketPrefix=trailwhisperer-artifacts-<account-id> \
     BedrockModelId=anthropic.claude-3-5-sonnet-20241022-v2:0
 ```
+
+> `ArtifactBucketPrefix` must match the prefix `publish.sh` printed (it appends a
+> uniqueness suffix — the AWS account id by default). The one-click Launch URL sets
+> this automatically; only the CLI path needs it passed explicitly.
 
 **Parameters:**
 
@@ -60,7 +65,7 @@ aws cloudformation deploy \
 |---|---|---|
 | `CloudTrailLogBucketName` | *(required)* | Existing S3 bucket receiving CloudTrail management events. |
 | `VpcFlowLogsBucketName` | *(required)* | Existing S3 bucket receiving VPC Flow Logs (default fields). |
-| `ArtifactBucketPrefix` | `trailwhisperer-artifacts` | Release bucket prefix; real bucket is `<prefix>-<region>`. |
+| `ArtifactBucketPrefix` | `trailwhisperer-artifacts` | Release bucket prefix; real bucket is `<prefix>-<region>`. `publish.sh` appends a uniqueness suffix (AWS account id by default), so use the prefix it prints, e.g. `trailwhisperer-artifacts-<account-id>`. |
 | `ArtifactVersion` | `v1` | Release version = S3 key prefix under the artifact bucket. |
 | `GlueDatabaseName` | `trailwhisperer_db` | Glue database created by the stack. |
 | `GlueTableName` | `cloudtrail_logs` | CloudTrail Glue table name. |
@@ -100,11 +105,16 @@ serverless/scripts/publish.sh v1 us-east-1 eu-west-1
 
 This runs `serverless/scripts/build-backend.sh` (packages `backend/` + deps into a
 Python 3.13 Lambda zip via manylinux wheels — works on macOS/Linux, no Docker), then
-for each region creates `trailwhisperer-artifacts-<region>` if missing and uploads
-`backend.zip`, `stack.yaml`, and `frontend/`. It prints a ready-to-use **Launch Stack URL**.
+for each region creates `trailwhisperer-artifacts-<account-id>-<region>` if missing
+and uploads `backend.zip`, `stack.yaml`, and `frontend/`. It prints the
+`ArtifactBucketPrefix` to use plus a ready-to-use **Launch Stack URL** (which already
+embeds that prefix).
 
 - **Backend arch:** set `LAMBDA_ARCH=aarch64` before building for arm64 Lambdas (default `x86_64`).
-- **Bucket prefix:** override with `ARTIFACT_BUCKET_PREFIX=...` (must match the `ArtifactBucketPrefix` stack parameter).
+- **Bucket prefix:** override the base with `ARTIFACT_BUCKET_PREFIX=...`. S3 names are global,
+  so the script appends a uniqueness suffix — the **AWS account id** by default (stable across
+  re-publishes, so the bucket is reused). Override the suffix with `ARTIFACT_BUCKET_SUFFIX=...`
+  (e.g. a timestamp). For a CLI deploy, pass the printed prefix as the `ArtifactBucketPrefix` param.
 
 > **⚠️ Public distribution — security note.** By default the artifact bucket is
 > **private**, so only principals in the bucket's own AWS account can deploy from it.
