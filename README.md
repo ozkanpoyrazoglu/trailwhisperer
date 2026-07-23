@@ -221,8 +221,4 @@ deploy/                   Deployment options (see deploy/README.md)
     scripts/publish.sh        Publish a release to regional artifact buckets + Launch Stack URL
   ec2/                      AWS CDK (Python) app: data plane + docker-compose EC2 instance
 docker-compose.yml        Local dev: backend (Uvicorn) + static frontend
-AGENT_CONTEXT.md          Canonical architecture summary
-AUTHENTICATION.md         Backend AWS credential resolution (Lambda vs. local)
-SECURITY_FINDINGS.md      Security review notes
-roadmap.md                Development tracker
 ```
