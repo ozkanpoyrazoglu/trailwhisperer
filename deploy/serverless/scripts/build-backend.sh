@@ -4,7 +4,8 @@
 # so this runs on macOS/Linux without Docker. Set LAMBDA_ARCH=aarch64 for arm64 Lambdas.
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# Repo root is three levels up: deploy/serverless/scripts/ -> repo root.
+ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 BUILD="$ROOT/build/backend"
 DIST="$ROOT/dist"
 ARCH="${LAMBDA_ARCH:-x86_64}"          # x86_64 (default) or aarch64

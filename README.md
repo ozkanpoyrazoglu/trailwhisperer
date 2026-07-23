@@ -97,92 +97,17 @@ If you enable `EnableProwlerScan` (see below), a scan runs on **CodeBuild** (`BU
 
 ---
 
-## Deploying to AWS
+## Deploying
 
-Deployment is **one click**: the CloudFormation stack pulls the packaged backend from a release bucket, and a bundled custom resource publishes the SPA (with the live API URL baked into `config.js`) into S3 — no manual Lambda upload, no manual S3 sync, no `?api=` wiring.
+TrailWhisperer offers **two deployment paths** — a zero-idle-cost **serverless**
+stack (CloudFormation, one-click) and an always-on **EC2** option (AWS CDK) that
+runs the same Docker containers as local dev on a VM. Both provision the identical
+Athena / Glue / S3 / IAM data plane.
 
-There are two audiences:
+👉 **Full deployment guide — parameters, one-click launch, publishing releases, and teardown — lives in [`deploy/README.md`](deploy/README.md).**
 
-- **Deploying an existing release** → just click *Launch Stack* (or run the CLI command). Start here.
-- **Publishing a release** (you maintain the artifacts) → see [Publishing a release](#publishing-a-release-maintainers) first, once.
-
-### Prerequisites
-
-- An **existing CloudTrail → S3** setup (management events delivered to a bucket). Optionally a **VPC Flow Logs → S3** bucket (default fields, delivered to S3).
-- **Amazon Bedrock model access** enabled in your region for the model you intend to use (default: `anthropic.claude-3-5-sonnet-20241022-v2:0`). Enable it in the Bedrock console under *Model access*.
-- A **published release** in the region you're deploying to (an artifact bucket `trailwhisperer-artifacts-<region>` containing `backend.zip` + frontend). If you're the maintainer and haven't published yet, do [that](#publishing-a-release-maintainers) first.
-
-> **Region note:** deploy in the **same region** as your Athena/Glue, Bedrock model access, **and the artifact bucket** (Lambda code buckets are region-local).
-
-### Option A — One-click "Launch Stack" (Console)
-
-Once a release is published, `scripts/publish.sh` prints a **Launch Stack URL** per region. Put it behind a button in your fork's README:
-
-```markdown
-[![Launch Stack](https://s3.amazonaws.com/cloudformation-examples/cloudformation-launch-stack.png)](https://us-east-1.console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/create/review?templateURL=https://trailwhisperer-artifacts-us-east-1.s3.us-east-1.amazonaws.com/v1/stack.yaml&stackName=ct-nl-investigator&param_ArtifactVersion=v1)
-```
-
-Clicking it opens the CloudFormation console with the template pre-loaded. Then:
-
-1. Fill in the **Parameters** (see the table below) — at minimum `CloudTrailLogBucketName` and `VpcFlowLogsBucketName`.
-2. Check **"I acknowledge that AWS CloudFormation might create IAM resources."**
-3. **Create stack** and wait for **CREATE_COMPLETE**.
-4. Open the **Outputs** tab → click `UiUrl`. That's the working console.
-
-### Option B — Deploy via the CLI
-
-```bash
-aws cloudformation deploy \
-  --template-file investigator-stack.yaml \
-  --stack-name ct-nl-investigator \
-  --capabilities CAPABILITY_IAM \
-  --parameter-overrides \
-    CloudTrailLogBucketName=my-org-cloudtrail-logs \
-    VpcFlowLogsBucketName=my-org-vpc-flow-logs \
-    ArtifactVersion=v1 \
-    BedrockModelId=anthropic.claude-3-5-sonnet-20241022-v2:0
-```
-
-**Parameters:**
-
-| Parameter | Default | Description |
-|---|---|---|
-| `CloudTrailLogBucketName` | *(required)* | Existing S3 bucket receiving CloudTrail management events. |
-| `VpcFlowLogsBucketName` | *(required)* | Existing S3 bucket receiving VPC Flow Logs (default fields). |
-| `ArtifactBucketPrefix` | `trailwhisperer-artifacts` | Release bucket prefix; real bucket is `<prefix>-<region>`. |
-| `ArtifactVersion` | `v1` | Release version = S3 key prefix under the artifact bucket. |
-| `GlueDatabaseName` | `trailwhisperer_db` | Glue database created by the stack. |
-| `GlueTableName` | `cloudtrail_logs` | CloudTrail Glue table name. |
-| `VpcFlowLogsTableName` | `vpc_flow_logs` | VPC Flow Logs Glue table name. |
-| `BedrockModelId` | `anthropic.claude-3-5-sonnet-20241022-v2:0` | Bedrock model for NL→SQL and summarization. |
-| `BytesScannedCutoff` | `1073741824` (1 GB) | Per-query bytes-scanned cap (runaway-cost guard). |
-| `AllowedTimeRangeMaxDays` | `90` | Max time window (days) the orchestrator allows per query. |
-| `EnableProwlerScan` | `false` | When `true`, provision the optional [Prowler security scan](#optional-prowler-security-scan) (CodeBuild + findings bucket + Glue table) and expose findings to the orchestrator. |
-| `ProwlerFindingsTableName` | `prowler_findings` | Glue table mapping the Prowler JSON findings (used only when `EnableProwlerScan=true`). |
-
-The stack creates: the Athena results bucket (7-day lifecycle) and SPA bucket, a CloudFront distribution (Origin Access Control), the Athena Workgroup with the bytes-scanned cutoff, the Glue database + two partition-projected tables, the auth-token secret (auto-generated), the orchestrator Lambda (code from the release bucket) + HTTP API, a least-privilege IAM role, and the SPA-deployer custom resource that publishes the frontend + `config.js`.
-
-### After it's up
-
-Get the URL and login token:
-
-```bash
-# Console URL
-aws cloudformation describe-stacks --stack-name ct-nl-investigator \
-  --query "Stacks[0].Outputs[?OutputKey=='UiUrl'].OutputValue" --output text
-
-# Auth token (paste into the login modal on first load)
-aws secretsmanager get-secret-value \
-  --secret-id "$(aws cloudformation describe-stacks --stack-name ct-nl-investigator \
-    --query "Stacks[0].Outputs[?OutputKey=='AuthSecretArn'].OutputValue" --output text)" \
-  --query SecretString --output text
-```
-
-Open `UiUrl`, paste the token into the login modal (stored in `localStorage`, sent as `Authorization: Bearer <token>`). The API endpoint is already wired via `config.js` — nothing else to configure.
-
-Other outputs: `ApiUrl` (HTTP API endpoint), `SpaBucketName`, `AthenaWorkGroupName`. When `EnableProwlerScan=true`, also `ProwlerScanProjectName` (the CodeBuild project to trigger) and `ProwlerFindingsBucketName`.
-
----
+- **Serverless (recommended, ~$0 idle):** [`deploy/serverless/`](deploy/serverless/) — CloudFormation template + build/publish scripts.
+- **EC2 (always-on VM):** [`deploy/ec2/`](deploy/ec2/) — CDK app that stands up the data plane plus a `docker compose` instance.
 
 ## Optional Prowler security scan
 
@@ -207,34 +132,6 @@ Once the build finishes, ask things like *"List my critical Prowler findings"* o
 > **Correlation caveat — honest scope.** You can also ask *"did the open security groups flagged by Prowler receive any internet traffic?"*, which `UNION ALL`s the finding with VPC Flow Logs. This is a **heuristic, side-by-side correlation by port / internet-facing traffic — not a precise per-security-group join.** VPC Flow Logs record ENIs and IPs and carry **no security-group id**, so there is no key to tie a *specific* `sg-…` to specific flows. Treat it as a triage aid, not proof.
 
 > **Field-mapping note.** The CodeBuild `jq` step maps Prowler's ASFF fields to the Glue table's flat columns (`GeneratorId`→`check_id`, `Compliance.Status`→`PASS`/`FAIL`, `Severity.Label`→lowercase `severity`, `Resources[0]`→`resource_id`/`region`, etc.). These mappings are based on Prowler's current ASFF schema; if a Prowler version emits different field names, adjust the `jq` filter in the `ProwlerScanProject` buildspec. Check the CodeBuild build log — it prints `Findings rows: N` — to confirm the transform produced rows.
-
----
-
-## Publishing a release (maintainers)
-
-The Launch Stack button needs the packaged artifacts hosted in a regional bucket. Publish once per version, per region you want to support:
-
-```bash
-# builds dist/backend.zip (manylinux wheels) and uploads backend + stack + frontend
-scripts/publish.sh v1 us-east-1 eu-west-1
-```
-
-This runs `scripts/build-backend.sh` (packages `backend/` + its deps into a Python 3.13 Lambda zip using manylinux wheels — works on macOS/Linux, no Docker), then for each region creates `trailwhisperer-artifacts-<region>` if missing and uploads `backend.zip`, `stack.yaml`, and `frontend/`. It prints a ready-to-use **Launch Stack URL** for each region.
-
-- **Backend arch:** set `LAMBDA_ARCH=aarch64` before building for arm64 Lambdas (default `x86_64`).
-- **Bucket prefix:** override with `ARTIFACT_BUCKET_PREFIX=...` (must match the `ArtifactBucketPrefix` stack parameter).
-
-> **⚠️ Public distribution — security note.** By default the artifact bucket is **private**, so only principals in the bucket's **own AWS account** can deploy from it (fine for your own/org use). To let *anyone* deploy from a public Launch Stack link, run `PUBLIC=1 scripts/publish.sh ...` to make the release objects world-readable. Only do this for artifacts you intend to distribute publicly — the `backend.zip`, template, and frontend become downloadable by anyone. Never put secrets in the artifact bucket.
-
-### Teardown
-
-Everything is one stack, and the SPA-deployer custom resource empties the stack-owned S3 buckets (SPA + Athena results) on delete, so cleanup is genuinely one command:
-
-```bash
-aws cloudformation delete-stack --stack-name ct-nl-investigator
-```
-
-(This does not touch your source CloudTrail/VPC log buckets or the release/artifact bucket — those are external inputs.)
 
 ---
 
@@ -278,9 +175,13 @@ The default local auth token is `local-dev-token` (from `docker-compose.yml`); u
 backend/                  FastAPI app (main.py), Dockerfile, requirements, mock_server.py
   requirements-lambda.txt   Lambda-only deps (no uvicorn; boto3 from runtime)
 frontend/                 Vanilla JS SPA (index.html, style.css, app.js, config.js) — no build step
-scripts/build-backend.sh  Package backend/ into dist/backend.zip (manylinux wheels)
-scripts/publish.sh        Publish a release to regional artifact buckets + print Launch Stack URL
-investigator-stack.yaml   One-click CloudFormation template (the whole system)
+deploy/                   Deployment options (see deploy/README.md)
+  README.md                 Full deployment guide (serverless + EC2)
+  serverless/               CloudFormation one-click stack
+    investigator-stack.yaml   The whole system as one template
+    scripts/build-backend.sh  Package backend/ into dist/backend.zip (manylinux wheels)
+    scripts/publish.sh        Publish a release to regional artifact buckets + Launch Stack URL
+  ec2/                      AWS CDK (Python) app: data plane + docker-compose EC2 instance
 docker-compose.yml        Local dev: backend (Uvicorn) + static frontend
 AGENT_CONTEXT.md          Canonical architecture summary
 AUTHENTICATION.md         Backend AWS credential resolution (Lambda vs. local)

@@ -3,8 +3,8 @@
 # Uploads backend.zip + stack.yaml + frontend/ to a regional artifact bucket
 # ("<prefix>-<region>") for EACH region you want to support.
 #
-#   scripts/publish.sh <version> <region> [region ...]
-#   scripts/publish.sh v1 us-east-1 eu-west-1
+#   deploy/serverless/scripts/publish.sh <version> <region> [region ...]
+#   deploy/serverless/scripts/publish.sh v1 us-east-1 eu-west-1
 #
 # Env:
 #   ARTIFACT_BUCKET_PREFIX  bucket prefix (default: trailwhisperer-artifacts)
@@ -14,13 +14,16 @@
 #                          own AWS account. See README security note before using.
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# Repo root is three levels up: deploy/serverless/scripts/ -> repo root.
+ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+# The CloudFormation template lives alongside these scripts under deploy/serverless/.
+STACK_TEMPLATE="$(cd "$(dirname "$0")/.." && pwd)/investigator-stack.yaml"
 VERSION="${1:?usage: publish.sh <version> <region> [region ...]}"; shift
 [ "$#" -gt 0 ] || { echo "error: give at least one region" >&2; exit 1; }
 PREFIX="${ARTIFACT_BUCKET_PREFIX:-trailwhisperer-artifacts}"
 PUBLIC="${PUBLIC:-0}"
 
-"$ROOT/scripts/build-backend.sh"
+"$(dirname "$0")/build-backend.sh"
 
 for region in "$@"; do
   bucket="${PREFIX}-${region}"
@@ -48,7 +51,7 @@ for region in "$@"; do
   fi
 
   aws s3 cp "$ROOT/dist/backend.zip"          "s3://$bucket/$VERSION/backend.zip" >/dev/null
-  aws s3 cp "$ROOT/investigator-stack.yaml"   "s3://$bucket/$VERSION/stack.yaml"  >/dev/null
+  aws s3 cp "$STACK_TEMPLATE"                 "s3://$bucket/$VERSION/stack.yaml"  >/dev/null
   aws s3 sync "$ROOT/frontend/"               "s3://$bucket/$VERSION/frontend/" --delete >/dev/null
 
   url="https://${bucket}.s3.${region}.amazonaws.com/${VERSION}/stack.yaml"

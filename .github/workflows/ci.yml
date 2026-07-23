@@ -53,7 +53,7 @@ jobs:
       # IaC lint of the CloudFormation template (no AWS credentials needed).
       # Fail only on errors; pre-existing style warnings (e.g. W1020) don't block CI.
       - name: cfn-lint (IaC lint)
-        run: cfn-lint --non-zero-exit-code error investigator-stack.yaml
+        run: cfn-lint --non-zero-exit-code error deploy/serverless/investigator-stack.yaml
 
       # IaC misconfiguration scan (SHA-pinned action). Report-only for now: the template has
       # pre-existing HIGH findings (e.g. AWS-0006 workgroup encryption) tracked separately in
@@ -62,7 +62,7 @@ jobs:
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
         with:
           scan-type: config
-          scan-ref: investigator-stack.yaml
+          scan-ref: deploy/serverless/investigator-stack.yaml
           severity: HIGH,CRITICAL
           exit-code: "0"
 
@@ -117,7 +117,7 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION || 'us-east-1' }}
-        run: aws cloudformation validate-template --template-body file://investigator-stack.yaml
+        run: aws cloudformation validate-template --template-body file://deploy/serverless/investigator-stack.yaml
 
       - name: Skip CFN validate-template (no AWS credentials)
         if: steps.awscreds.outputs.present != 'true'
@@ -125,4 +125,4 @@ jobs:
 
       # 4. Build integrity — package the orchestrator Lambda.
       - name: Build backend Lambda package
-        run: ./scripts/build-backend.sh
+        run: ./deploy/serverless/scripts/build-backend.sh

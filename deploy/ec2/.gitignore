@@ -1,0 +1,6 @@
+# CDK synth output & Python venv
+cdk.out/
+.venv/
+venv/
+__pycache__/
+*.pyc
