@@ -404,8 +404,10 @@ class TrailWhispererEc2Stack(Stack):
             "cat > frontend/config.js <<EOF",
             'window.TRAILWHISPERER_CONFIG = { apiBase: "http://'"$PUBLIC_IP"':8000" };',
             "EOF",
-            # Bring the stack up (build backend image + serve frontend).
-            "docker compose up -d --build",
+            # Bring the stack up (build backend image + serve frontend). Pass only
+            # the base compose file so the local-dev override (Uvicorn --reload) is
+            # NOT applied on this always-on VM — the backend runs the production CMD.
+            "docker compose -f docker-compose.yml up -d --build",
         )
 
         instance = ec2.Instance(

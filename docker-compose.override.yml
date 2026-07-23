@@ -1,0 +1,7 @@
+# Local-development overrides, merged automatically by `docker compose up`.
+# Adds Uvicorn auto-reload for the backend — a dev-only convenience that must NOT
+# ship in the production image (L3). Non-dev targets (the EC2 deploy) explicitly
+# run `docker compose -f docker-compose.yml up` so this file is skipped.
+services:
+  backend:
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload

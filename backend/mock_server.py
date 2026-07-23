@@ -181,6 +181,12 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _authed(self) -> bool:
+        # NOTE (L4): this is a LOCAL DEMO mock, not a security control. It uses a
+        # plain `==` comparison (not constant-time like the real backend's
+        # hmac.compare_digest) and the SQL "guardrail" below is a naive substring
+        # check ("select" in sql) — NOT the real parse-based validate_sql(). Do not
+        # mistake either for the production guardrail; they exist only to drive the
+        # SPA end-to-end without AWS.
         auth = self.headers.get("Authorization", "")
         token = auth[7:] if auth.lower().startswith("bearer ") else auth
         return token == AUTH_TOKEN

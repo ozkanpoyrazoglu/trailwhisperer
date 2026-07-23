@@ -659,10 +659,13 @@ Resources:
     Properties:
       Name: !Sub "${AWS::StackName}-api"
       ProtocolType: HTTP
-      CorsConfiguration:
-        AllowOrigins: ["*"]
-        AllowMethods: ["GET", "POST", "OPTIONS"]
-        AllowHeaders: ["authorization", "content-type"]
+      # CORS is handled by the FastAPI Lambda (CORSMiddleware), which pins the
+      # allowed origin to this stack's CloudFront domain via the ALLOWED_ORIGIN
+      # env var. We deliberately do NOT set an API-level CorsConfiguration here:
+      # it can only be a wildcard (referencing SpaDistribution.DomainName would
+      # create a circular dependency, since the SPA's CSP already references this
+      # API's endpoint), and a wildcard would override the Lambda's pinned origin.
+      # The `ANY /{proxy+}` route forwards OPTIONS preflight to the Lambda (L1).
 
   ApiIntegration:
     Type: AWS::ApiGatewayV2::Integration

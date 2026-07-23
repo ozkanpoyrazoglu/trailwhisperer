@@ -17,7 +17,10 @@ services:
       AUTH_TOKEN: ${AUTH_TOKEN:-local-dev-token}
     env_file:
       - .env
-    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    # No `command:` here — the image's production CMD is used by default.
+    # Local dev auto-reload is layered on by docker-compose.override.yml, which
+    # `docker compose up` merges automatically. Non-dev targets (e.g. the EC2
+    # deploy) run `docker compose -f docker-compose.yml up` to skip the override.
 
   frontend:
     image: python:3.13-slim
