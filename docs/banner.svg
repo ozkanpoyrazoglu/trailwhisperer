@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="300" viewBox="0 0 1200 300" fill="none" role="img" aria-label="TrailWhisperer — natural-language forensic auditing for AWS CloudTrail and VPC Flow Logs">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1200" y2="300" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0b1120"/>
+      <stop offset="0.55" stop-color="#0d1a2b"/>
+      <stop offset="1" stop-color="#0f2534"/>
+    </linearGradient>
+    <linearGradient id="drift" x1="0" y1="0" x2="1" y2="0.35">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="0.5" stop-color="#7ce8f4"/>
+      <stop offset="1" stop-color="#12a6c4"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.14" cy="0.1" r="0.7">
+      <stop offset="0" stop-color="#22d3ee" stop-opacity="0.20"/>
+      <stop offset="1" stop-color="#22d3ee" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glow2" cx="0.92" cy="0.95" r="0.6">
+      <stop offset="0" stop-color="#38bdf8" stop-opacity="0.12"/>
+      <stop offset="1" stop-color="#38bdf8" stop-opacity="0"/>
+    </radialGradient>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <circle cx="1" cy="1" r="1" fill="#22d3ee" fill-opacity="0.06"/>
+    </pattern>
+  </defs>
+
+  <!-- backdrop -->
+  <rect x="0" y="0" width="1200" height="300" rx="26" fill="url(#bg)"/>
+  <rect x="0" y="0" width="1200" height="300" rx="26" fill="url(#grid)"/>
+  <rect x="0" y="0" width="1200" height="300" rx="26" fill="url(#glow)"/>
+  <rect x="0" y="0" width="1200" height="300" rx="26" fill="url(#glow2)"/>
+  <rect x="0.75" y="0.75" width="1198.5" height="298.5" rx="25.25" fill="none" stroke="#22d3ee" stroke-opacity="0.16"/>
+
+  <!-- TW monogram tile -->
+  <g transform="translate(62 84)">
+    <rect x="0" y="0" width="132" height="132" rx="30" fill="#0F2534"/>
+    <rect x="0.5" y="0.5" width="131" height="131" rx="29.5" fill="none" stroke="#22d3ee" stroke-opacity="0.35"/>
+    <rect x="0" y="0" width="132" height="132" rx="30" fill="url(#glow)" fill-opacity="0.5"/>
+    <text x="66" y="89" text-anchor="middle" font-family="'Sora','Segoe UI',system-ui,sans-serif" font-size="62" font-weight="700" letter-spacing="-2.5" fill="url(#drift)">TW</text>
+  </g>
+
+  <!-- wordmark -->
+  <text x="230" y="138" font-family="'Sora','Segoe UI',system-ui,sans-serif" font-size="60" font-weight="700" letter-spacing="-2">
+    <tspan fill="#e2e8f0">Trail</tspan><tspan fill="url(#drift)">Whisperer</tspan>
+  </text>
+
+  <!-- tagline -->
+  <text x="232" y="180" font-family="'Sora','Segoe UI',system-ui,sans-serif" font-size="21" font-weight="500" letter-spacing="-0.2" fill="#94a3b8">
+    Natural-language forensic auditing for AWS CloudTrail &amp; VPC Flow Logs
+  </text>
+
+  <!-- feature chips -->
+  <g font-family="'Sora','Segoe UI',system-ui,sans-serif" font-size="17" font-weight="600">
+    <g transform="translate(232 206)">
+      <circle cx="8" cy="13" r="4" fill="#22d3ee"/>
+      <text x="21" y="19" fill="#cbd5e1">Read-only &amp; SELECT-only</text>
+    </g>
+    <g transform="translate(510 206)">
+      <circle cx="8" cy="13" r="4" fill="#fbbf24"/>
+      <text x="21" y="19" fill="#cbd5e1">Human-in-the-loop</text>
+    </g>
+    <g transform="translate(740 206)">
+      <circle cx="8" cy="13" r="4" fill="#34d399"/>
+      <text x="21" y="19" fill="#cbd5e1">Serverless · ~$0 idle</text>
+    </g>
+  </g>
+</svg>
