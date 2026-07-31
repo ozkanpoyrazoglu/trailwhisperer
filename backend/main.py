@@ -378,6 +378,8 @@ SUMMARY_SYSTEM = (
     '"flags": ["<notable/anomalous observation>", ...]}. '
     "Flags are heuristic: repeated failures, unusual principals/IPs, privilege changes, "
     "sensitive API calls, off-hours activity. Empty list if nothing stands out. "
+    "Keep it SHORT so the JSON always closes: at most 5 flags, each ONE sentence. Group "
+    'repetition ("12 flows from 98.87.175.76") instead of listing every row. '
     f"{NO_REDACTION} Name the concrete principals, IPs and resources from the rows in both "
     "the summary and the flags."
 )
@@ -750,9 +752,61 @@ def _fetch_rows(execution_id: str):
     return header or [], rows
 
 
+def _salvage_summary_json(text: str):
+    """Recover {summary, flags} from a reply whose JSON never closed — the model
+    hit the max-tokens ceiling mid-object. Uses the stdlib JSON string scanner so
+    escapes are handled, keeps every COMPLETE flag, and drops the partial one.
+    Returns dict or None."""
+    def _read_string_at(quote: int):
+        """Decode the JSON string whose opening quote is at `quote`."""
+        try:
+            return json.decoder.scanstring(text, quote + 1)  # -> (value, end)
+        except ValueError:
+            return None
+
+    def _value_quote(key: str) -> int:
+        k = text.find(f'"{key}"')
+        return -1 if k == -1 else text.find('"', k + len(key) + 2)
+
+    summary, truncated = "", False
+    q = _value_quote("summary")
+    if q != -1:
+        got = _read_string_at(q)
+        if got:
+            summary = got[0]
+        else:
+            # The summary itself was cut off — keep the readable prefix.
+            summary = text[q + 1:].rstrip().rstrip("\\") + " […]"
+            truncated = True
+
+    flags = []
+    k = text.find('"flags"')
+    if k != -1:
+        pos = text.find("[", k) + 1
+        while pos > 0:
+            q = text.find('"', pos)
+            close = text.find("]", pos)
+            if q == -1 or (close != -1 and close < q):
+                break
+            got = _read_string_at(q)
+            if not got:
+                truncated = True  # partial flag — drop it
+                break
+            flags.append(got[0])
+            pos = got[1]
+
+    if not summary and not flags:
+        return None
+    if truncated:
+        flags.append("(This summary was cut short by the model's output limit; "
+                     "the result rows above are complete.)")
+    return {"summary": summary, "flags": flags}
+
+
 def _parse_summary_json(text: str):
     """Extract the {summary, flags} object even if the model wraps it in
-    markdown fences or surrounding prose. Returns dict or None."""
+    markdown fences or surrounding prose, or never closed the JSON at all.
+    Returns dict or None."""
     try:
         return json.loads(text)
     except ValueError:
@@ -763,17 +817,21 @@ def _parse_summary_json(text: str):
         try:
             return json.loads(text[start:end + 1])
         except ValueError:
-            return None
-    return None
+            pass
+    return _salvage_summary_json(text)
 
 
 def _summarize(question: str, rows: list, model_id: str | None = None):
     sample = rows[:SUMMARY_ROWS]
     user = f"Question: {question or 'Summarize this CloudTrail activity.'}\n\nRows (JSON):\n{json.dumps(sample, default=str)}"
-    text = _invoke(SUMMARY_SYSTEM, user, max_tokens=800, model_id=model_id)
+    # 800 tokens was not enough for a 200-row flow-log sample: the model ran out
+    # mid-JSON, the object never closed, and the raw text leaked into the summary
+    # panel unrendered. Verbose non-English narratives cost more tokens still.
+    text = _invoke(SUMMARY_SYSTEM, user, max_tokens=2000, model_id=model_id)
     data = _parse_summary_json(text)
     if isinstance(data, dict):
         return data.get("summary", ""), data.get("flags", [])
+    logger.warning("summary JSON unparseable (%d chars), returning raw text", len(text))
     return text, []
 
 
