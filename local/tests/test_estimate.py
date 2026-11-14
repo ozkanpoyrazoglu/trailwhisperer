@@ -105,3 +105,15 @@ def test_too_wide_scan_is_not_estimated():
     wide = est.TableLayout("cloudtrail_logs", CT.template, [str(i) for i in range(40)], [f"r{i}" for i in range(17)])
     e = est.estimate(f"SELECT 1 FROM cloudtrail_logs WHERE dt >= {DYN7}", {"cloudtrail_logs": wide}, FakeS3({}), TODAY)
     assert e.bytes is None and "too wide" in e.note
+
+
+def test_region_filter_under_not_or_function_is_not_trusted():
+    for cond in ("NOT (region = 'eu-west-1')", "lower(region) IN ('eu-west-1')", "(region = 'eu-west-1' OR 1=1)"):
+        p = one(f"SELECT 1 FROM cloudtrail_logs WHERE dt = '2026/11/10' AND {cond}")
+        assert p.regions == ["us-east-1", "eu-west-1"], cond
+
+
+def test_non_canonical_dt_is_refused_not_guessed():
+    for cond in ("dt > ''", "dt >= dt", "dt >= date_format(current_timestamp - interval '1' day - interval '9' day, '%Y/%m/%d')"):
+        with pytest.raises(ValueError):
+            est.plan(f"SELECT 1 FROM cloudtrail_logs WHERE {cond}", LAYOUTS, TODAY)

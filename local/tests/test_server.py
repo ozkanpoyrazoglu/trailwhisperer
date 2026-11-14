@@ -100,3 +100,10 @@ def test_run_query_runs_in_workgroup_and_caps_rows(fake):
 
 def test_get_results_only_for_own_executions(fake):
     assert "unknown execution id" in server.get_results("someone-elses-query")["error"]
+
+
+def test_unknown_estimate_fails_closed(fake, monkeypatch):
+    athena, _ = fake
+    monkeypatch.setattr(server.est, "estimate", lambda *a, **k: est.Estimate(bytes=None, note="too wide"))
+    r = server.run_query(OK_SQL, estimated_scan_mb=0, purpose="test")
+    assert r["allowed"] is False and r["stage"] == "estimate" and athena.started == []

@@ -88,7 +88,10 @@ def _check(sql: str) -> dict:
     e = est.estimate(sql, layouts(), _s3())
     result = {"allowed": True, "sql": sql, **e.as_dict()}
     limit = settings().max_scan_bytes
-    if e.bytes is not None and e.bytes > limit:
+    if e.bytes is None:
+        # Fail closed: a query we can't size doesn't run.
+        result.update(allowed=False, stage="estimate", reason=f"could not estimate the scan: {e.note}")
+    elif e.bytes > limit:
         result.update(allowed=False, stage="scan-limit",
                       reason=f"estimated scan {e.bytes / 1024**2:.1f} MB exceeds the {limit / 1024**2:.0f} MB limit; "
                              "narrow the dt window or filter by region/account")
@@ -139,7 +142,7 @@ def run_query(sql: str, estimated_scan_mb: float, purpose: str) -> dict:
     if not checked["allowed"]:
         return checked
     server_mb = checked["estimated_scan_mb"]
-    if server_mb is not None and abs(server_mb - estimated_scan_mb) > max(5.0, 0.1 * server_mb):
+    if abs(server_mb - estimated_scan_mb) > max(5.0, 0.1 * server_mb):
         return {"allowed": False, "stage": "estimate-mismatch",
                 "reason": f"estimated_scan_mb={estimated_scan_mb} does not match the server estimate "
                           f"({server_mb} MB). Call check_query and pass its value."}

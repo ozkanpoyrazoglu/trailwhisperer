@@ -34,6 +34,10 @@ _RECENT = "date_format(current_timestamp - interval '7' day, '%Y/%m/%d')"
         f'UNION ALL SELECT action AS a FROM vpc_flow_logs WHERE dt >= {_RECENT}',
         # recent literal dt bound (within cap)
         "SELECT eventtime FROM cloudtrail_logs WHERE dt >= '2999/01/01'",
+        # reversed operands and an extra non-binding dt predicate are fine
+        f"SELECT eventtime FROM cloudtrail_logs WHERE {_RECENT} <= dt",
+        # dt under OR alongside a binding AND predicate
+        f"SELECT eventtime FROM cloudtrail_logs WHERE dt >= {_RECENT} AND (dt = '2999/01/01' OR eventname = 'x')",
     ],
 )
 def test_accepts_safe_queries(sql):
@@ -68,6 +72,17 @@ def test_accepts_safe_queries(sql):
         # UNION ALL with one branch unbound
         f"SELECT eventname AS a FROM cloudtrail_logs WHERE dt >= {_RECENT} "
         "UNION ALL SELECT action AS a FROM vpc_flow_logs WHERE action = 'ACCEPT'",
+        # Non-canonical dt bounds that used to count as "binding" but prune nothing:
+        "SELECT * FROM cloudtrail_logs WHERE dt > ''",                         # empty string
+        "SELECT * FROM cloudtrail_logs WHERE dt >= dt",                        # tautology
+        "SELECT * FROM cloudtrail_logs WHERE dt >= lower('x')",                # arbitrary function
+        "SELECT * FROM cloudtrail_logs WHERE dt >= '2026/1/5'",                # not zero-padded
+        "SELECT * FROM cloudtrail_logs WHERE substr(dt, 1, 4) >= '2026'",      # dt wrapped
+        f"SELECT * FROM cloudtrail_logs WHERE NOT (dt < {_RECENT})",            # under NOT
+        "SELECT * FROM cloudtrail_logs WHERE '2999/01/01' >= dt",              # upper bound only
+        # summed intervals, each under the cap, together far beyond it
+        "SELECT * FROM cloudtrail_logs WHERE dt >= date_format(current_timestamp - interval '80' day "
+        "- interval '80' day, '%Y/%m/%d')",
     ],
 )
 def test_rejects_unsafe_queries(sql):

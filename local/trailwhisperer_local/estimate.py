@@ -83,98 +83,39 @@ class Estimate:
 
 
 # --- Reading partition bounds out of the SQL ----------------------------------
-
-def _resolve_date(node: exp.Expression, today: date) -> date | None:
-    """A dt bound is either a 'yyyy/MM/dd' literal or the
-    date_format(current_timestamp - interval 'N' unit, ...) form the grounding asks for."""
-    if isinstance(node, exp.Literal):
-        return guardrail.dt_literal(node)
-    lits = [guardrail.dt_literal(lit) for lit in node.find_all(exp.Literal)]
-    lits = [d for d in lits if d]
-    if lits:
-        return lits[0]
-    iv = node.find(exp.Interval)
-    if iv is not None:
-        days = guardrail.interval_days(iv)
-        if days is None:
-            return None
-        return today - timedelta(days=days or 1)  # sub-day windows can reach into yesterday
-    if node.find(exp.CurrentTimestamp, exp.CurrentDate) is not None:
-        return today
-    return None
-
-
-def _column_side(cmp: exp.Expression, column: str) -> str | None:
-    left, right = cmp.this, cmp.expression
-    if isinstance(left, exp.Column) and left.name.lower() == column:
-        return "left"
-    if isinstance(right, exp.Column) and right.name.lower() == column:
-        return "right"
-    return None
-
-
-def dt_range(select: exp.Select, today: date) -> tuple[date, date] | None:
-    """Narrowest [start, end] the select's AND-context `dt` predicates allow."""
-    start, end = None, today
-    preds = guardrail.binding_predicates(select, "dt", kinds=(exp.GTE, exp.GT, exp.EQ, exp.Between, exp.In, exp.LTE, exp.LT))
-    for cmp in preds:
-        if isinstance(cmp, exp.Between):
-            lo, hi = _resolve_date(cmp.args["low"], today), _resolve_date(cmp.args["high"], today)
-            if lo is None or hi is None:
-                return None
-            start, end = max(start or lo, lo), min(end, hi)
-        elif isinstance(cmp, exp.In):
-            ds = [guardrail.dt_literal(e) for e in cmp.expressions if isinstance(e, exp.Literal)]
-            if not ds or None in ds:
-                return None
-            start, end = max(start or min(ds), min(ds)), min(end, max(ds))
-        else:
-            side = _column_side(cmp, "dt")
-            if side is None:
-                continue
-            other = cmp.expression if side == "left" else cmp.this
-            d = _resolve_date(other, today)
-            if d is None:
-                return None
-            lower = isinstance(cmp, (exp.GTE, exp.GT)) == (side == "left")
-            if isinstance(cmp, exp.EQ):
-                start, end = max(start or d, d), min(end, d)
-            elif lower:
-                start = max(start or d, d)
-            else:
-                end = min(end, d)
-    if start is None:
-        return None
-    return start, end
-
+# The dt range comes from guardrail.dt_bounds, the same function the guardrail
+# uses, so the estimator can't read a query differently from the check that let it through.
 
 def _literal_filter(select: exp.Select, column: str) -> list[str] | None:
-    """Values a select pins a partition column to (`= 'x'` or `IN ('x','y')`), else None."""
-    values: set[str] = set()
+    """Values a select pins a partition column to (`col = 'x'` or `col IN ('x','y')`),
+    else None, meaning every projected value is scanned."""
+    values: set[str] | None = None
     for cmp in guardrail.binding_predicates(select, column, kinds=(exp.EQ, exp.In)):
         if isinstance(cmp, exp.In):
-            vals = [e.this for e in cmp.expressions if isinstance(e, exp.Literal) and e.is_string]
+            if not guardrail._is_column(cmp.this, column) or cmp.args.get("query"):
+                continue
+            vals = {e.this for e in cmp.expressions if isinstance(e, exp.Literal) and e.is_string}
+            if len(vals) != len(cmp.expressions):
+                continue
         else:
-            other = cmp.expression if _column_side(cmp, column) == "left" else cmp.this
-            vals = [other.this] if isinstance(other, exp.Literal) and other.is_string else []
-        if not vals:
-            return None
-        values = set(vals) if not values else values & set(vals)
+            other = cmp.expression if guardrail._is_column(cmp.this, column) else cmp.this
+            if not (isinstance(other, exp.Literal) and other.is_string):
+                continue
+            vals = {other.this}
+        values = vals if values is None else values & vals
     return sorted(values) if values else None
 
 
 def plan(sql: str, layouts: dict[str, TableLayout], today: date | None = None) -> list[ScanPlan]:
     """One ScanPlan per (select, log table) the statement reads. Raises ValueError
-    when a scanning select has no resolvable dt range."""
+    when a scanning select has no canonical dt range."""
     today = today or datetime.now(timezone.utc).date()
     stmt = guardrail.parse_one(sql)
     plans = []
     for select in stmt.find_all(exp.Select):
         for table in sorted(guardrail.own_tables(select) & set(layouts)):
             layout = layouts[table]
-            rng = dt_range(select, today)
-            if rng is None:
-                raise ValueError(f"could not work out the dt range for `{table}`")
+            rng = guardrail.dt_bounds(select, today)  # raises ValueError on non-canonical dt
             accounts = _literal_filter(select, "account") or layout.accounts
             regions = _literal_filter(select, "region") or layout.regions
             plans.append(ScanPlan(table, accounts, regions, rng[0], rng[1]))
