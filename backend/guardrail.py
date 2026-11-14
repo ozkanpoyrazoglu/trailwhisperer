@@ -148,12 +148,14 @@ PARTITION_COLUMNS = frozenset({"dt", "region", "account"})
 
 
 def source_qualifiers(select: exp.Select) -> set[str]:
-    """Names a column may be qualified with to mean the FROM table (its name and alias)."""
+    """The qualifier that means this select's FROM table. Like Trino, an alias hides
+    the table name: inside `FROM cloudtrail_logs c`, `cloudtrail_logs.dt` would bind
+    to an OUTER query's row (a correlated reference), not to this scan."""
     src = select.args.get("from")
     src = src.this if src else None
     if not isinstance(src, exp.Table):
         return set()
-    return {n.lower() for n in (src.name, src.alias) if n}
+    return {(src.alias or src.name).lower()}
 
 
 def belongs_to_source(col: exp.Column, select: exp.Select) -> bool:
