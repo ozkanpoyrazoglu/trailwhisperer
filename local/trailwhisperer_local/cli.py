@@ -315,7 +315,7 @@ def cmd_doctor(a):
                "date_format(current_timestamp - interval '1' day, '%Y/%m/%d')")
 
         def one_day(sql=sql):
-            e = est.estimate(sql, layouts, sess.client("s3"))
+            e = est.estimate(sql, layouts, est.s3_client(sess))
             if e.bytes is None:
                 raise RuntimeError(e.note)
             return f"{e.bytes / 1024**2:.2f} MB in {e.objects} objects across {e.prefixes} prefixes"
