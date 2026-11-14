@@ -230,6 +230,12 @@ def validate(sql: str, policy: Policy):
     for sel in stmt.find_all(exp.Select):
         if not own_tables(sel) & policy.time_partitioned:
             continue
+        # One unqualified `dt` filter can't be attributed to one of several tables,
+        # so a SELECT that reads a log table reads only that table. UNNEST is fine:
+        # it expands a column of the same rows and scans nothing new.
+        if any(not isinstance(j.this, exp.Unnest) for j in sel.args.get("joins") or []):
+            return False, ("a SELECT that reads a log table may not JOIN other tables; "
+                           "correlate sources with UNION ALL instead")
         try:
             start, _ = dt_bounds(sel, today)
         except ValueError as e:

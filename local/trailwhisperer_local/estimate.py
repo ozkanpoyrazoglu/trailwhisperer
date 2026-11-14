@@ -116,8 +116,10 @@ def plan(sql: str, layouts: dict[str, TableLayout], today: date | None = None) -
         for table in sorted(guardrail.own_tables(select) & set(layouts)):
             layout = layouts[table]
             rng = guardrail.dt_bounds(select, today)  # raises ValueError on non-canonical dt
-            accounts = _literal_filter(select, "account") or layout.accounts
-            regions = _literal_filter(select, "region") or layout.regions
+            # Only values partition projection knows about narrow the scan; Athena
+            # returns nothing for the rest, so they can't make the estimate smaller.
+            accounts = [a for a in (_literal_filter(select, "account") or []) if a in layout.accounts] or layout.accounts
+            regions = [r for r in (_literal_filter(select, "region") or []) if r in layout.regions] or layout.regions
             plans.append(ScanPlan(table, accounts, regions, rng[0], rng[1]))
     return plans
 

@@ -117,3 +117,8 @@ def test_non_canonical_dt_is_refused_not_guessed():
     for cond in ("dt > ''", "dt >= dt", "dt >= date_format(current_timestamp - interval '1' day - interval '9' day, '%Y/%m/%d')"):
         with pytest.raises(ValueError):
             est.plan(f"SELECT 1 FROM cloudtrail_logs WHERE {cond}", LAYOUTS, TODAY)
+
+
+def test_unprojected_region_filter_falls_back_to_all_regions():
+    p = one("SELECT 1 FROM cloudtrail_logs WHERE dt = '2026/11/10' AND region = 'ap-south-9'")
+    assert p.regions == ["us-east-1", "eu-west-1"]

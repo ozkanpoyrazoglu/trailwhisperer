@@ -36,6 +36,8 @@ _RECENT = "date_format(current_timestamp - interval '7' day, '%Y/%m/%d')"
         "SELECT eventtime FROM cloudtrail_logs WHERE dt >= '2999/01/01'",
         # reversed operands and an extra non-binding dt predicate are fine
         f"SELECT eventtime FROM cloudtrail_logs WHERE {_RECENT} <= dt",
+        # UNNEST expands the same rows; it is not a second scan
+        f"SELECT r.arn FROM cloudtrail_logs CROSS JOIN UNNEST(resources) AS t(r) WHERE dt >= {_RECENT}",
         # dt under OR alongside a binding AND predicate
         f"SELECT eventtime FROM cloudtrail_logs WHERE dt >= {_RECENT} AND (dt = '2999/01/01' OR eventname = 'x')",
     ],
@@ -83,6 +85,10 @@ def test_accepts_safe_queries(sql):
         # summed intervals, each under the cap, together far beyond it
         "SELECT * FROM cloudtrail_logs WHERE dt >= date_format(current_timestamp - interval '80' day "
         "- interval '80' day, '%Y/%m/%d')",
+        # one dt filter, two scans: the joined side is unbounded
+        f"SELECT * FROM cloudtrail_logs a JOIN cloudtrail_logs b ON a.eventid = b.eventid WHERE a.dt >= {_RECENT}",
+        f"SELECT * FROM cloudtrail_logs a, vpc_flow_logs b WHERE a.dt >= {_RECENT}",
+        f"SELECT * FROM cloudtrail_logs a JOIN (SELECT * FROM vpc_flow_logs) b ON true WHERE a.dt >= {_RECENT}",
     ],
 )
 def test_rejects_unsafe_queries(sql):
