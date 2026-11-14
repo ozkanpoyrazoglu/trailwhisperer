@@ -92,13 +92,15 @@ def _literal_filter(select: exp.Select, column: str) -> list[str] | None:
     values: set[str] | None = None
     for cmp in guardrail.binding_predicates(select, column, kinds=(exp.EQ, exp.In)):
         if isinstance(cmp, exp.In):
-            if not guardrail._is_column(cmp.this, column) or cmp.args.get("query"):
+            if not (guardrail._is_column(cmp.this, column) and guardrail.belongs_to_source(cmp.this, select)) \
+                    or cmp.args.get("query"):
                 continue
             vals = {e.this for e in cmp.expressions if isinstance(e, exp.Literal) and e.is_string}
             if len(vals) != len(cmp.expressions):
                 continue
         else:
-            other = cmp.expression if guardrail._is_column(cmp.this, column) else cmp.this
+            col_left = guardrail._is_column(cmp.this, column) and guardrail.belongs_to_source(cmp.this, select)
+            other = cmp.expression if col_left else cmp.this
             if not (isinstance(other, exp.Literal) and other.is_string):
                 continue
             vals = {other.this}

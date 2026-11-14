@@ -84,7 +84,7 @@ def binding_predicates(select: exp.Select, column: str, kinds=_DT_BINDING):
         if cmp.find_ancestor(exp.Select) is not select or predicate_context(cmp, where) != "and":
             continue
         operands = [cmp.this] + ([cmp.expression] if isinstance(cmp, exp.Binary) else [])
-        if any(_is_column(o, column) for o in operands):
+        if any(_is_column(o, column) and belongs_to_source(o, select) for o in operands):
             out.append(cmp)
     return out
 
@@ -144,6 +144,36 @@ def resolve_dt_bound(node: exp.Expression, today: date) -> date | None:
     return None
 
 
+PARTITION_COLUMNS = frozenset({"dt", "region", "account"})
+
+
+def source_qualifiers(select: exp.Select) -> set[str]:
+    """Names a column may be qualified with to mean the FROM table (its name and alias)."""
+    src = select.args.get("from")
+    src = src.this if src else None
+    if not isinstance(src, exp.Table):
+        return set()
+    return {n.lower() for n in (src.name, src.alias) if n}
+
+
+def belongs_to_source(col: exp.Column, select: exp.Select) -> bool:
+    return not col.table or col.table.lower() in source_qualifiers(select)
+
+
+def check_no_shadowing(select: exp.Select) -> None:
+    """An UNNEST may not introduce a column or alias that could pass for the log
+    table's partition keys, e.g. CROSS JOIN UNNEST(ARRAY['2999/01/01']) AS t(dt)."""
+    taken = source_qualifiers(select)
+    for j in select.args.get("joins") or []:
+        alias = j.this.args.get("alias") if isinstance(j.this, exp.Unnest) else None
+        if not alias:
+            continue
+        names = {c.name.lower() for c in alias.columns} | ({alias.name.lower()} if alias.name else set())
+        if names & (PARTITION_COLUMNS | taken):
+            raise ValueError("UNNEST aliases may not reuse the partition column names (dt, region, account) "
+                             "or the log table's name/alias")
+
+
 _DT_REQUIRED = (
     "WHERE must bind the `dt` partition key with a range/equality filter "
     "in AND context (not under OR, not only in a subquery), e.g. "
@@ -160,6 +190,7 @@ def dt_bounds(select: exp.Select, today: date) -> tuple[date, date]:
     unless every AND-context `dt` predicate has a canonical shape and at least one
     sets a lower bound. The guardrail and the scan estimator both call this, so
     they can never disagree about what a query reads."""
+    check_no_shadowing(select)
     where = select.args.get("where")
     if not where:
         raise ValueError(_DT_REQUIRED)
@@ -167,6 +198,8 @@ def dt_bounds(select: exp.Select, today: date) -> tuple[date, date]:
     for col in where.find_all(exp.Column):
         if col.name.lower() != "dt" or col.find_ancestor(exp.Select) is not select:
             continue
+        if not belongs_to_source(col, select):
+            raise ValueError("`dt` must refer to the log table (unqualified, or qualified with its name or alias)")
         cmp = col.parent
         ctx = predicate_context(cmp, where) if cmp is not where else "and"
         if ctx == "or":

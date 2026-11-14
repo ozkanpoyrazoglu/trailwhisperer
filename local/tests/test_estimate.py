@@ -122,3 +122,9 @@ def test_non_canonical_dt_is_refused_not_guessed():
 def test_unprojected_region_filter_falls_back_to_all_regions():
     p = one("SELECT 1 FROM cloudtrail_logs WHERE dt = '2026/11/10' AND region = 'ap-south-9'")
     assert p.regions == ["us-east-1", "eu-west-1"]
+
+
+def test_region_filter_on_unnest_alias_is_not_trusted():
+    p = one("SELECT 1 FROM cloudtrail_logs c CROSS JOIN UNNEST(resources) AS t(r) "
+            "WHERE c.dt = '2026/11/10' AND t.region = 'eu-west-1'")
+    assert p.regions == ["us-east-1", "eu-west-1"]
