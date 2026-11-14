@@ -14,11 +14,22 @@ Ask *"Who changed the security group last week?"* or *"Show me rejected SSH conn
 
 It is **serverless, ephemeral, and low-cost**: there is no always-on compute. Deploy it when you need to investigate, tear it down when you're done. Idle cost is effectively zero.
 
-> **No stack? Use it from Claude Code.** [`local/`](local/README.md) runs the same guardrail as an MCP server for Claude Code / Claude Desktop: Claude writes the SQL, the server validates it, estimates the scan from real S3 object sizes and runs it only after you approve. Setup is one `init` command, no CloudFormation.
+## Two ways to run it
+
+| | **Local** ([`local/`](local/README.md)) | **Serverless** ([`deploy/`](deploy/README.md)) |
+|---|---|---|
+| Who writes the SQL | The AI agent you already use (Claude Code, Cursor, Claude Desktop, any MCP client) | Amazon Bedrock |
+| Model cost | Your agent subscription | Bedrock, per question, in the investigated account |
+| In the investigated account | 4 objects from one `init` command (Glue DB + tables, workgroup, results bucket), $0 idle | One CloudFormation stack (~30 resources), ~$0 idle |
+| Interface | Your agent's chat; its tool-approval prompt is the approval step | Web console with an approval modal |
+| Scan estimate before running | Exact, from S3 object sizes; can't-estimate means can't-run | Scan scope shown in the approval modal |
+| Prowler findings | Not yet | Optional |
+
+Both use the same `backend/guardrail.py` and grounding, so a guardrail fix lands in both. If you are not sure, start with local: there is nothing to deploy, and `teardown` removes everything `init` created.
 
 ---
 
-## What it does (step by step)
+## What it does (step by step, serverless version)
 
 ```mermaid
 flowchart TD
@@ -44,7 +55,7 @@ flowchart TD
 
 1. **You ask a question in natural language** in the web console (optionally scoping it with a time range or model choice).
 2. **Grounded NL → SQL.** The backend sends your question to Amazon Bedrock along with the Glue table schema, a CloudTrail/VPC field crib-sheet, and few-shot examples. Bedrock returns Athena (Trino-dialect) SQL.
-3. **Guardrail validation.** The generated SQL is parsed (not string-matched) and rejected unless it is a single **`SELECT`** against a whitelisted table, with a **mandatory `dt` partition filter** and a bounded time window. This keeps the query read-only *and* keeps Athena bytes-scanned (cost) low.
+3. **Guardrail validation.** The generated SQL is parsed (not string-matched) and rejected unless it is a single **`SELECT`** against whitelisted tables in which every log-table `SELECT` binds the **`dt` partition** with a canonical bound (a `'yyyy/MM/dd'` literal or `date_format(current_timestamp - interval 'N' day, '%Y/%m/%d')`) inside a bounded time window. JOINs on log tables, `dt` under `OR`/`NOT`, correlated or shadowed `dt` references and summed intervals are all rejected. This keeps the query read-only *and* keeps Athena bytes-scanned (cost) low. The full rule list is in [local/README.md](local/README.md#what-the-guardrail-enforces).
 4. **Human-in-the-loop approval.** The SQL is **never executed automatically.** It is displayed in an approval "warrant" modal — with a plain-language explanation of what it does and an estimated scan scope — for you to **Approve / Edit / Cancel**. (An opt-in auto-run mode still shows the SQL and offers a cancellable countdown before running.)
 5. **Athena execution.** On approval, the query runs against your CloudTrail / VPC Flow Log data via an Athena Workgroup that enforces a per-query bytes-scanned cutoff.
 6. **Grounded summarization.** Bedrock summarizes **only the rows Athena actually returned** — it does not invent data — into a narrative plus heuristic severity flags (info / review / critical). Results are also shown as a paginated table with a per-query bytes-scanned and estimated-cost indicator.
