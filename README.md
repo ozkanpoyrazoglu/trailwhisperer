@@ -14,6 +14,8 @@ Ask *"Who changed the security group last week?"* or *"Show me rejected SSH conn
 
 It is **serverless, ephemeral, and low-cost**: there is no always-on compute. Deploy it when you need to investigate, tear it down when you're done. Idle cost is effectively zero.
 
+> **No stack? Use it from Claude Code.** [`local/`](local/README.md) runs the same guardrail as an MCP server for Claude Code / Claude Desktop: Claude writes the SQL, the server validates it, estimates the scan from real S3 object sizes and runs it only after you approve. Setup is one `init` command, no CloudFormation.
+
 ---
 
 ## What it does (step by step)
@@ -211,6 +213,11 @@ The default local auth token is `local-dev-token` (from `docker-compose.yml`); u
 
 ```
 backend/                  FastAPI app (main.py), Dockerfile, requirements, mock_server.py
+  guardrail.py              Parse-based SQL guardrail, shared with local/
+  grounding.py              Schema crib-sheets + few-shot examples, shared with local/
+local/                    MCP server for Claude Code / Desktop (see local/README.md)
+  trailwhisperer_local/     server.py (MCP tools), estimate.py (scan estimate), cli.py (init/teardown/policy/doctor)
+pyproject.toml            Packaging for trailwhisperer-local (uvx-installable)
   requirements-lambda.txt   Lambda-only deps (no uvicorn; boto3 from runtime)
 frontend/                 Vanilla JS SPA (index.html, style.css, app.js, config.js) — no build step
 deploy/                   Deployment options (see deploy/README.md)

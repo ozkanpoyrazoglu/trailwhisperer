@@ -34,6 +34,16 @@ _RECENT = "date_format(current_timestamp - interval '7' day, '%Y/%m/%d')"
         f'UNION ALL SELECT action AS a FROM vpc_flow_logs WHERE dt >= {_RECENT}',
         # recent literal dt bound (within cap)
         "SELECT eventtime FROM cloudtrail_logs WHERE dt >= '2999/01/01'",
+        # reversed operands and an extra non-binding dt predicate are fine
+        f"SELECT eventtime FROM cloudtrail_logs WHERE {_RECENT} <= dt",
+        # UNNEST expands the same rows; it is not a second scan
+        f"SELECT r.arn FROM cloudtrail_logs CROSS JOIN UNNEST(resources) AS t(r) WHERE dt >= {_RECENT}",
+        # dt qualified with the log table's alias
+        f"SELECT c.eventname FROM cloudtrail_logs c WHERE c.dt >= {_RECENT}",
+        # unaliased table qualified with its own name
+        f"SELECT eventname FROM cloudtrail_logs WHERE cloudtrail_logs.dt >= {_RECENT}",
+        # dt under OR alongside a binding AND predicate
+        f"SELECT eventtime FROM cloudtrail_logs WHERE dt >= {_RECENT} AND (dt = '2999/01/01' OR eventname = 'x')",
     ],
 )
 def test_accepts_safe_queries(sql):
@@ -68,6 +78,28 @@ def test_accepts_safe_queries(sql):
         # UNION ALL with one branch unbound
         f"SELECT eventname AS a FROM cloudtrail_logs WHERE dt >= {_RECENT} "
         "UNION ALL SELECT action AS a FROM vpc_flow_logs WHERE action = 'ACCEPT'",
+        # Non-canonical dt bounds that used to count as "binding" but prune nothing:
+        "SELECT * FROM cloudtrail_logs WHERE dt > ''",                         # empty string
+        "SELECT * FROM cloudtrail_logs WHERE dt >= dt",                        # tautology
+        "SELECT * FROM cloudtrail_logs WHERE dt >= lower('x')",                # arbitrary function
+        "SELECT * FROM cloudtrail_logs WHERE dt >= '2026/1/5'",                # not zero-padded
+        "SELECT * FROM cloudtrail_logs WHERE substr(dt, 1, 4) >= '2026'",      # dt wrapped
+        f"SELECT * FROM cloudtrail_logs WHERE NOT (dt < {_RECENT})",            # under NOT
+        "SELECT * FROM cloudtrail_logs WHERE '2999/01/01' >= dt",              # upper bound only
+        # summed intervals, each under the cap, together far beyond it
+        "SELECT * FROM cloudtrail_logs WHERE dt >= date_format(current_timestamp - interval '80' day "
+        "- interval '80' day, '%Y/%m/%d')",
+        # one dt filter, two scans: the joined side is unbounded
+        f"SELECT * FROM cloudtrail_logs a JOIN cloudtrail_logs b ON a.eventid = b.eventid WHERE a.dt >= {_RECENT}",
+        f"SELECT * FROM cloudtrail_logs a, vpc_flow_logs b WHERE a.dt >= {_RECENT}",
+        f"SELECT * FROM cloudtrail_logs a JOIN (SELECT * FROM vpc_flow_logs) b ON true WHERE a.dt >= {_RECENT}",
+        # an UNNEST column named dt standing in for the partition key
+        "SELECT * FROM cloudtrail_logs c CROSS JOIN UNNEST(ARRAY['2999/01/01']) AS t(dt) WHERE t.dt >= '2999/01/01'",
+        f"SELECT * FROM cloudtrail_logs c CROSS JOIN UNNEST(resources) AS t(r) WHERE t.dt >= {_RECENT}",
+        f"SELECT * FROM cloudtrail_logs c CROSS JOIN UNNEST(resources) AS c(r) WHERE c.dt >= {_RECENT}",
+        # inner scan "bounded" by a correlated reference to the outer row's dt
+        f"SELECT * FROM cloudtrail_logs WHERE dt >= {_RECENT} AND eventid IN "
+        f"(SELECT eventid FROM cloudtrail_logs c WHERE cloudtrail_logs.dt >= {_RECENT})",
     ],
 )
 def test_rejects_unsafe_queries(sql):

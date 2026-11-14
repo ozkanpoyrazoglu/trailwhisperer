@@ -4,16 +4,16 @@ import json
 import logging
 import os
 import time
-from datetime import datetime, timedelta, timezone
 
 import boto3
-import sqlglot
 from botocore.exceptions import ClientError
 from fastapi import Depends, FastAPI, Header, HTTPException, Path
 from fastapi.middleware.cors import CORSMiddleware
 from mangum import Mangum
 from pydantic import BaseModel, Field
-from sqlglot import exp
+
+import guardrail
+from grounding import CRIB, NO_REDACTION, PROWLER_CRIB, VPC_CRIB, fewshot, prowler_fewshot
 
 logger = logging.getLogger("trailwhisperer")
 
@@ -166,117 +166,8 @@ def require_auth(authorization: str = Header(default="")):
 
 # --- Grounding -------------------------------------------------------------
 
-CRIB = (
-    "eventtime: ISO8601 UTC timestamp of the API call. "
-    "eventname/eventsource: the API action and service. "
-    "useridentity: struct(type, arn, username, accountid, sessioncontext...). "
-    "sourceipaddress, useragent: caller origin. "
-    "errorcode/errormessage: set when the call failed/was denied. "
-    "requestparameters/responseelements: JSON strings (not structs). "
-    "To read a TOP-LEVEL field, use json_extract_scalar(requestparameters, '$.groupId'). "
-    "Nested arrays (e.g. security-group ipPermissions -> ipRanges) are awkward to unnest reliably, "
-    "so for values buried inside arrays prefer RESILIENT string matching on the raw JSON, e.g. an "
-    "open CIDR + port 22 rule: requestparameters LIKE '%\"cidrIp\":\"0.0.0.0/0\"%' "
-    "AND requestparameters LIKE '%\"fromPort\":22%' (note: AWS may serialize with or without a space "
-    "after the colon, so match the bare token like '%\"fromPort\":22%' or use '%fromPort%22%'). "
-    "awsregion, recipientaccountid. "
-    "Partitions: account, region, dt. "
-    "dt is a STRING partition key formatted 'yyyy/MM/dd' (e.g. '2026/07/18'); "
-    "it is MANDATORY in WHERE for partition pruning and must be filtered as "
-    "dt >= date_format(current_timestamp - interval 'N' day, '%Y/%m/%d')."
-)
-
-VPC_CRIB = (
-    "version, account_id, interface_id: flow metadata. "
-    "srcaddr/dstaddr: source/destination IP. srcport/dstport: ports. "
-    "protocol: IANA protocol number (6=TCP, 17=UDP, 1=ICMP). "
-    "packets, bytes: volume transferred. "
-    "start, end: Unix epoch SECONDS of the flow window "
-    "(`end` is a reserved word — always quote it as \"end\"). "
-    "action: 'ACCEPT' or 'REJECT'. log_status: 'OK'/'NODATA'/'SKIPDATA'. "
-    "Partitions: account, region, dt. "
-    "dt is a STRING partition key formatted 'yyyy/MM/dd' (e.g. '2026/07/18'); "
-    "it is MANDATORY in WHERE for partition pruning and must be filtered as "
-    "dt >= date_format(current_timestamp - interval 'N' day, '%Y/%m/%d')."
-)
-
-PROWLER_CRIB = (
-    "Prowler is an AWS security scanner; each row is ONE check result (a point-in-time "
-    "posture snapshot, NOT time-series). "
-    "status: 'PASS' or 'FAIL' (a FAIL is an open security issue). "
-    "severity: 'critical' | 'high' | 'medium' | 'low' | 'informational'. "
-    "check_id: the Prowler check identifier, e.g. "
-    "'ec2_securitygroup_allow_ingress_from_internet_to_tcp_port_22' (SSH open to the internet) "
-    "or '..._to_tcp_port_3389' (RDP). Match with `=` or `LIKE`. "
-    "check_title: human-readable check description. status_extended: one-line detail of the result. "
-    "service_name: the AWS service (e.g. 'ec2', 's3', 'iam'). region: AWS region of the resource. "
-    "resource_id: the flagged resource (e.g. a security-group id like 'sg-0abc123'); "
-    "resource_arn: its full ARN. account_id: the audited account. "
-    "IMPORTANT: this table is NOT partitioned and has NO time column — do NOT add a `dt` or "
-    "event-time filter when querying it alone; filter by status/severity/check_id/service instead."
-)
-
-FEWSHOT = (
-    "Q: Who changed a security group last week?\n"
-    f"SQL: SELECT eventtime, useridentity.arn, eventname, sourceipaddress FROM {GLUE_TABLE} "
-    "WHERE dt >= date_format(current_timestamp - interval '7' day, '%Y/%m/%d') "
-    "AND eventname IN ('AuthorizeSecurityGroupIngress','RevokeSecurityGroupIngress','AuthorizeSecurityGroupEgress') "
-    "AND eventtime >= to_iso8601(current_timestamp - interval '7' day) ORDER BY eventtime DESC;\n\n"
-    "Q: Failed console logins in the last 3 days?\n"
-    f"SQL: SELECT eventtime, useridentity.username, sourceipaddress, errormessage FROM {GLUE_TABLE} "
-    "WHERE dt >= date_format(current_timestamp - interval '3' day, '%Y/%m/%d') "
-    "AND eventname = 'ConsoleLogin' AND errorcode IS NOT NULL "
-    "AND eventtime >= to_iso8601(current_timestamp - interval '3' day) ORDER BY eventtime DESC;\n\n"
-    "Q: Which hosts had rejected connections on port 22 yesterday?\n"
-    f'SQL: SELECT from_unixtime("start") AS flow_start, srcaddr, dstaddr, dstport, action FROM {GLUE_VPC_TABLE} '
-    "WHERE dt >= date_format(current_timestamp - interval '1' day, '%Y/%m/%d') "
-    "AND action = 'REJECT' AND dstport = 22 "
-    "AND \"start\" >= to_unixtime(current_timestamp - interval '1' day) ORDER BY \"start\" DESC;\n\n"
-    "Q: Did IP 198.51.100.42 make any API calls or network connections yesterday?\n"
-    "SQL: SELECT from_iso8601_timestamp(eventtime) AS event_time, 'cloudtrail' AS source, eventname AS action, useridentity.arn AS identity "
-    f"FROM {GLUE_TABLE} "
-    "WHERE dt >= date_format(current_timestamp - interval '1' day, '%Y/%m/%d') "
-    "AND sourceipaddress = '198.51.100.42' "
-    "AND eventtime >= to_iso8601(current_timestamp - interval '1' day) "
-    "UNION ALL "
-    "SELECT from_unixtime(\"start\") AS event_time, 'vpc_flow' AS source, "
-    "action AS action, srcaddr AS identity "
-    f"FROM {GLUE_VPC_TABLE} "
-    "WHERE dt >= date_format(current_timestamp - interval '1' day, '%Y/%m/%d') "
-    "AND srcaddr = '198.51.100.42' "
-    "AND \"start\" >= to_unixtime(current_timestamp - interval '1' day) "
-    "ORDER BY event_time DESC;\n\n"
-    "Q: Who opened SSH or RDP to the public (0.0.0.0/0) this week?\n"
-    "SQL: SELECT eventtime, useridentity.arn, eventname, "
-    "json_extract_scalar(requestparameters, '$.groupId') AS group_id, sourceipaddress "
-    f"FROM {GLUE_TABLE} "
-    "WHERE dt >= date_format(current_timestamp - interval '7' day, '%Y/%m/%d') "
-    "AND eventname IN ('AuthorizeSecurityGroupIngress','AuthorizeSecurityGroupEgress') "
-    "AND requestparameters LIKE '%\"cidrIp\":\"0.0.0.0/0\"%' "
-    "AND (requestparameters LIKE '%\"fromPort\":22%' OR requestparameters LIKE '%\"fromPort\":3389%') "
-    "AND eventtime >= to_iso8601(current_timestamp - interval '7' day) ORDER BY eventtime DESC;"
-)
-
-# Prowler few-shot (appended to FEWSHOT only when GLUE_PROWLER_TABLE is set).
-# Demonstrates a plain findings query and cross-log correlation: take an open
-# security-group finding and check VPC Flow Logs for actual internet traffic.
-PROWLER_FEWSHOT = (
-    "\n\nQ: List my critical Prowler findings.\n"
-    f"SQL: SELECT check_id, check_title, severity, service_name, resource_id, region "
-    f"FROM {GLUE_PROWLER_TABLE} "
-    "WHERE status = 'FAIL' AND severity = 'critical' ORDER BY service_name;\n\n"
-    "Q: Did the open security groups flagged by Prowler receive any internet traffic?\n"
-    "SQL: SELECT 'prowler_finding' AS source, check_id AS detail, resource_id AS resource, severity AS extra "
-    f"FROM {GLUE_PROWLER_TABLE} "
-    "WHERE status = 'FAIL' "
-    "AND check_id LIKE 'ec2_securitygroup_allow_ingress_from_internet_to_tcp_port_%' "
-    "UNION ALL "
-    "SELECT 'vpc_flow' AS source, action AS detail, dstaddr AS resource, CAST(dstport AS varchar) AS extra "
-    f"FROM {GLUE_VPC_TABLE} "
-    "WHERE dt >= date_format(current_timestamp - interval '7' day, '%Y/%m/%d') "
-    "AND action = 'ACCEPT' AND dstport IN (22, 3389) "
-    "AND \"start\" >= to_unixtime(current_timestamp - interval '7' day);"
-)
+FEWSHOT = fewshot(GLUE_TABLE, GLUE_VPC_TABLE)
+PROWLER_FEWSHOT = prowler_fewshot(GLUE_PROWLER_TABLE, GLUE_VPC_TABLE) if GLUE_PROWLER_TABLE else ""
 
 # Conditional Prowler grounding — only advertised when the findings table exists.
 _PROWLER_TABLE_LINE = (
@@ -304,20 +195,6 @@ _PROWLER_EXAMPLES = PROWLER_FEWSHOT if GLUE_PROWLER_TABLE else ""
 _PROWLER_EXEMPT = (
     " (The Prowler findings table is exempt: it is a static snapshot with no `dt`.)"
     if GLUE_PROWLER_TABLE else ""
-)
-
-# The whole point of an audit trail is naming the actor and the resource, so the
-# model must never substitute placeholders for identities, ARNs or IPs. Models
-# otherwise tend to "protect" these fields on their own initiative, which makes
-# the answer useless to the auditor.
-NO_REDACTION = (
-    "REPORT IDENTIFIERS VERBATIM: this is an authorized audit of the operator's own AWS "
-    "account, and the identity and resource fields ARE the answer. Always state usernames, "
-    "role/user ARNs, principal and account IDs, access key IDs, IP addresses, hostnames, "
-    "resource names and event IDs exactly as they appear in the data. NEVER redact, mask, "
-    "anonymize, truncate or replace them with placeholders such as "
-    "HIDDEN_DUE_TO_SECURITY_REASONS, REDACTED, <user>, x.x.x.x or similar. "
-    "Withholding these values is a failure, not a safeguard."
 )
 
 SQL_SYSTEM = (
@@ -485,170 +362,21 @@ def _clean_sql(text: str) -> str:
     return t.strip().rstrip(";").strip()
 
 
-# --- Guardrail helpers -----------------------------------------------------
-# A `dt` predicate that actually prunes partitions must narrow the scan: a lower
-# bound (>=/>), an exact match (=/IN), or a range (BETWEEN). Upper-bound-only
-# (</<=), IS [NOT] NULL, LIKE and <> do NOT bound how far back Athena scans, so
-# they don't count as binding.
-_DT_BINDING = (exp.GTE, exp.GT, exp.EQ, exp.Between, exp.In)
-_UNIT_DAYS = {
-    "day": 1, "days": 1, "week": 7, "weeks": 7,
-    "month": 30, "months": 30, "year": 365, "years": 365,
-}
+# --- Guardrail ---------------------------------------------------------------
+# The rules live in guardrail.py so the local MCP server enforces exactly the same
+# checks. Here we only bind them to this deployment's tables and limits.
 
-
-def _own_tables(select: exp.Select) -> set[str]:
-    """Whitelisted table names in THIS select's own FROM/joins (not nested
-    subqueries — those belong to their own inner select)."""
-    return {
-        t.name.lower()
-        for t in select.find_all(exp.Table)
-        if t.name and t.find_ancestor(exp.Select) is select
-    }
-
-
-def _under_or(node: exp.Expression, where: exp.Where) -> bool:
-    """True if `node` sits under an OR anywhere between it and its WHERE — such a
-    predicate can't be relied on to prune (Athena won't prune across an OR)."""
-    p = node.parent
-    while p is not None and p is not where:
-        if isinstance(p, exp.Or):
-            return True
-        p = p.parent
-    return False
-
-
-def _has_binding_dt(select: exp.Select) -> bool:
-    """True if this select's own WHERE contains a binding `dt` predicate in AND
-    context (not under OR, not only inside a nested subquery)."""
-    where = select.args.get("where")
-    if not where:
-        return False
-    for cmp in where.find_all(*_DT_BINDING):
-        # the comparison must belong to THIS select's WHERE, not a nested subquery
-        if cmp.find_ancestor(exp.Select) is not select:
-            continue
-        if _under_or(cmp, where):
-            continue
-        # the `dt` operand must itself belong to this select (guards against a
-        # dt filter that lives only inside a subquery on the RHS, e.g. IN (...))
-        if any(c.name.lower() == "dt" and c.find_ancestor(exp.Select) is select
-               for c in cmp.find_all(exp.Column)):
-            return True
-    return False
-
-
-def _dt_literal_bounds_ok(select: exp.Select) -> bool:
-    """Reject binding `dt` predicates whose bound is a STRING LITERAL ('yyyy/MM/dd')
-    older than MAX_DAYS ago (H1). The interval-based cap (`_window_within_cap`)
-    only catches dynamic `current_timestamp - interval 'N' day` windows; a
-    hand-edited literal bound like `dt >= '2000/01/01'` would otherwise slip past
-    it and full-scan far beyond the allowed window."""
-    where = select.args.get("where")
-    if not where:
-        return True
-    earliest = (datetime.now(timezone.utc) - timedelta(days=MAX_DAYS)).date()
-    for cmp in where.find_all(*_DT_BINDING):
-        if cmp.find_ancestor(exp.Select) is not select or _under_or(cmp, where):
-            continue
-        if not any(c.name.lower() == "dt" and c.find_ancestor(exp.Select) is select
-                   for c in cmp.find_all(exp.Column)):
-            continue
-        for lit in cmp.find_all(exp.Literal):
-            if not lit.is_string:
-                continue
-            try:
-                d = datetime.strptime(lit.this, "%Y/%m/%d").date()
-            except ValueError:
-                continue  # not a dt-format literal (e.g. an interval count) — ignore
-            if d < earliest:
-                return False
-    return True
-
-
-def _window_within_cap(stmt: exp.Expression) -> bool:
-    """Reject `interval 'N' <unit>` windows longer than MAX_DAYS."""
-    for iv in stmt.find_all(exp.Interval):
-        unit_node = iv.args.get("unit")
-        unit = (unit_node.name.lower() if unit_node else "")
-        factor = _UNIT_DAYS.get(unit)
-        if factor is None:  # sub-day units (hour/minute/...) never exceed the cap
-            continue
-        try:
-            n = int(iv.this.name)
-        except (AttributeError, ValueError):
-            continue
-        if n * factor > MAX_DAYS:
-            return False
-    return True
+GUARDRAIL_POLICY = guardrail.Policy(
+    database=GLUE_DATABASE,
+    time_partitioned=frozenset({GLUE_TABLE.lower(), GLUE_VPC_TABLE.lower()}),
+    static_tables=frozenset({GLUE_PROWLER_TABLE.lower()}) if GLUE_PROWLER_TABLE else frozenset(),
+    max_days=MAX_DAYS,
+)
 
 
 def validate_sql(sql: str):
     """Parse-based guardrail. Returns (ok, reason)."""
-    try:
-        statements = [s for s in sqlglot.parse(sql, dialect="trino") if s]
-    except Exception as e:
-        return False, f"could not parse SQL: {e}"
-    if len(statements) != 1:
-        return False, "exactly one statement is allowed"
-    stmt = statements[0]
-    forbidden = (
-        exp.Insert, exp.Update, exp.Delete, exp.Create, exp.Drop,
-        exp.Alter, exp.Merge, exp.Command,
-    )
-    if any(stmt.find(f) for f in forbidden):
-        return False, "only read-only SELECT statements are allowed"
-    if not isinstance(stmt, (exp.Select, exp.Union)):
-        return False, "query must be a SELECT"
-    # Time-partitioned LOG tables require the mandatory `dt` filter; the optional
-    # Prowler findings table is a static snapshot (no partitions), so it is
-    # whitelisted for scanning but exempt from the `dt` requirement.
-    time_partitioned = {GLUE_TABLE.lower(), GLUE_VPC_TABLE.lower()}
-    allowed = set(time_partitioned)
-    if GLUE_PROWLER_TABLE:
-        allowed.add(GLUE_PROWLER_TABLE.lower())
-    # CTE names are local aliases, not real tables — a valid read-only CTE like
-    # `WITH x AS (SELECT ... FROM cloudtrail_logs) SELECT * FROM x` surfaces `x`
-    # as an exp.Table. Exclude CTE names before diffing against the whitelist (M1).
-    cte_names = {c.alias_or_name.lower() for c in stmt.find_all(exp.CTE) if c.alias_or_name}
-    real_tables = [t for t in stmt.find_all(exp.Table) if t.name and t.name.lower() not in cte_names]
-    tables = {t.name.lower() for t in real_tables}
-    if not tables:
-        return False, "query must scan a whitelisted table"
-    if tables - allowed:
-        allowed_list = "`, `".join(sorted(allowed))
-        return False, f"only tables `{allowed_list}` may be queried"
-    # A whitelisted bare name in another database (`otherdb.cloudtrail_logs`) must
-    # not slip through on name alone (M1). IAM `glue:GetTable` scoping is the real
-    # backstop, but reject a mismatched DB qualifier here too.
-    for t in real_tables:
-        if t.db and t.db.lower() != GLUE_DATABASE.lower():
-            return False, "cross-database table references are not allowed"
-
-    # Partition pruning is non-negotiable for the LOG tables: EVERY select that
-    # scans a time-partitioned table must itself bind the `dt` partition key
-    # (yyyy/MM/dd). Checking mere presence of the column name is not enough — it
-    # lets OR branches, non-range predicates (IS NOT NULL/LIKE), subquery-only
-    # filters and unpruned UNION branches through. We require a binding predicate
-    # in the AND context of each scanning select's own WHERE. Prowler-only selects
-    # are skipped (no partitions / no time column).
-    scanning = [s for s in stmt.find_all(exp.Select) if _own_tables(s) & time_partitioned]
-    for s in scanning:
-        if not _has_binding_dt(s):
-            return False, (
-                "WHERE must bind the `dt` partition key with a range/equality filter "
-                "in AND context (not under OR, not only in a subquery), e.g. "
-                "dt >= date_format(current_timestamp - interval 'N' day, '%Y/%m/%d')"
-            )
-        if not _dt_literal_bounds_ok(s):
-            return False, f"the `dt` window reaches further back than the {MAX_DAYS}-day maximum"
-
-    # Enforce the configured maximum time window (partition pruning alone doesn't
-    # cap how far back the window reaches).
-    if not _window_within_cap(stmt):
-        return False, f"time window exceeds the {MAX_DAYS}-day maximum"
-
-    return True, None
+    return guardrail.validate(sql, GUARDRAIL_POLICY)
 
 
 @app.get("/api/health")

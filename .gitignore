@@ -39,3 +39,4 @@ dist/
 build/
 *.zip
 packaged.yaml
+.venv-local/

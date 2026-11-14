@@ -87,16 +87,18 @@ jobs:
 
       # 1. Python syntax verification.
       - name: Python syntax check (py_compile)
-        run: python -m compileall -q backend
+        run: python -m compileall -q backend local
 
-      # 2. Unit tests (skips cleanly until tests are added).
-      - name: Unit tests
+      # 2. Unit tests. The backend (FastAPI) and the local MCP server (mcp 2.x)
+      #    pin incompatible Starlette versions, so each gets its own environment.
+      - name: Unit tests (backend)
+        run: pytest -q backend
+
+      - name: Unit tests (local MCP server)
         run: |
-          if ls backend/test_*.py backend/tests/test_*.py tests/test_*.py >/dev/null 2>&1; then
-            pytest -q
-          else
-            echo "No unit tests found — skipping. Add backend/test_*.py (or tests/test_*.py) to enable."
-          fi
+          python -m venv /tmp/tw-local
+          /tmp/tw-local/bin/pip install -q '.[dev]'
+          /tmp/tw-local/bin/pytest -q local/tests
 
       # 3. CloudFormation template validation (needs AWS credentials).
       #    Secrets are scoped to only the steps that use them (never job-wide env).
