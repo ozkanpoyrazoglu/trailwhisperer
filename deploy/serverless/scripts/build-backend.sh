@@ -26,7 +26,7 @@ echo "==> installing deps ($ARCH, py$PY) into $BUILD"
   -r "$ROOT/backend/requirements-lambda.txt"
 
 echo "==> adding application code"
-cp "$ROOT/backend/main.py" "$BUILD/"
+cp "$ROOT/backend/main.py" "$ROOT/backend/guardrail.py" "$ROOT/backend/grounding.py" "$BUILD/"
 
 echo "==> zipping"
 rm -f "$DIST/backend.zip"
