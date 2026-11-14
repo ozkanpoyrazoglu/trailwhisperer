@@ -66,7 +66,32 @@ Allow the read-only tools, keep `run_query` behind a prompt, and stop Claude fro
 }
 ```
 
-Claude Desktop: add the same command to `claude_desktop_config.json` under `mcpServers`.
+### Other MCP clients (Cursor, Claude Desktop, ...)
+
+The server speaks plain MCP over stdio, so any MCP client works and uses its own model; nothing here calls Bedrock. For Cursor, put this in `.cursor/mcp.json` (or `~/.cursor/mcp.json`); Claude Desktop takes the same block in `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "trailwhisperer": {
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/ozkanpoyrazoglu/trailwhisperer", "trailwhisperer-local", "serve"],
+      "env": { "AWS_PROFILE": "trailwhisperer", "AWS_REGION": "eu-central-1" }
+    }
+  }
+}
+```
+
+Whatever the client, keep `run_query` out of its auto-run / auto-approve list so a person approves each execution.
+
+### Many accounts
+
+Add one entry per account, each with its own profile. The model can't switch accounts, because the profile is fixed in the client config, not passed as a tool argument:
+
+```bash
+claude mcp add tw-customer-a -e AWS_PROFILE=customer-a-readonly -e AWS_REGION=eu-central-1 -- uvx --from git+https://github.com/ozkanpoyrazoglu/trailwhisperer trailwhisperer-local serve
+claude mcp add tw-customer-b -e AWS_PROFILE=customer-b-readonly -e AWS_REGION=eu-west-1    -- uvx --from git+https://github.com/ozkanpoyrazoglu/trailwhisperer trailwhisperer-local serve
+```
 
 ## 4. Ask
 

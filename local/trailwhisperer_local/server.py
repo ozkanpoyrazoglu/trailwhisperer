@@ -55,8 +55,9 @@ def _athena():
     return _session().client("athena")
 
 
+@functools.lru_cache(maxsize=1)
 def _s3():
-    return _session().client("s3")
+    return est.s3_client(_session())
 
 
 @functools.lru_cache(maxsize=1)

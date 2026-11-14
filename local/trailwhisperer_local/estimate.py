@@ -18,6 +18,13 @@ from . import guardrail
 ATHENA_USD_PER_TB = 5.0          # us-east-1 list price; most Regions match
 ATHENA_MIN_BYTES = 10 * 1024**2  # Athena bills at least 10 MB per query
 MAX_PREFIXES = 3000              # refuse to estimate absurdly wide scans
+LIST_WORKERS = 16                # parallel ListObjectsV2 calls
+
+
+def s3_client(session):
+    """S3 client whose connection pool matches the estimator's parallelism."""
+    from botocore.config import Config
+    return session.client("s3", config=Config(max_pool_connections=LIST_WORKERS))
 
 
 @dataclass
@@ -160,7 +167,7 @@ def estimate(sql: str, layouts: dict[str, TableLayout], s3, today: date | None =
     if len(prefixes) > MAX_PREFIXES:
         return Estimate(bytes=None, plans=plans, prefixes=len(prefixes),
                         note=f"{len(prefixes)} partitions is too wide to size; filter by region or narrow dt")
-    with ThreadPoolExecutor(max_workers=16) as pool:
+    with ThreadPoolExecutor(max_workers=LIST_WORKERS) as pool:
         sizes = list(pool.map(lambda bp: _prefix_size(s3, *bp), prefixes))
     return Estimate(
         bytes=sum(s for s, _ in sizes), plans=plans, prefixes=len(prefixes),
