@@ -16,6 +16,8 @@ It is **serverless, ephemeral, and low-cost**: there is no always-on compute. De
 
 ## Two ways to run it
 
+<p align="center"><img src="docs/diagrams/before-after.png" alt="Serverless version: browser, CloudFront, API Gateway, Lambda, Bedrock and Athena in the customer account. Local version: the AI agent and the MCP server on your laptop, and only an Athena workgroup, Glue tables and a results bucket in the account." width="840"></p>
+
 | | **Local** ([`local/`](local/README.md)) | **Serverless** ([`deploy/`](deploy/README.md)) |
 |---|---|---|
 | Who writes the SQL | The AI agent you already use (Claude Code, Cursor, Claude Desktop, any MCP client) | Amazon Bedrock |

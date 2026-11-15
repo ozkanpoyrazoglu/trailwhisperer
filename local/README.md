@@ -15,6 +15,8 @@ Your agent writes the Athena SQL. This MCP server decides whether it runs:
 
 The guardrail is the same module the [serverless version](../README.md) uses, so a fix lands in both.
 
+<p align="center"><img src="../docs/diagrams/architecture.png" alt="The AI agent and the TrailWhisperer MCP server run on your laptop. The server assumes a narrow IAM role, lists S3 object sizes for the estimate, and runs approved queries in an Athena workgroup that reads the existing CloudTrail logs bucket and writes to a results bucket. init creates the workgroup, the Glue tables and the results bucket." width="840"></p>
+
 ## Why local
 
 - **Nothing to deploy into the account you investigate.** `init` creates four objects (a Glue database with two tables, an Athena workgroup, a results bucket) that cost nothing when idle. The serverless stack is about 30 resources.
@@ -125,6 +127,8 @@ claude mcp add tw-customer-b -e AWS_PROFILE=customer-b-readonly -e AWS_REGION=eu
 The agent reads the schema once (`get_investigation_context`), writes SQL, calls `check_query`, then asks to run it. `run_query` takes the estimate as an argument and the server checks it against its own, so the approval prompt shows the SQL **and** how many MB it will scan. The answer is built only from the rows that came back, with identities, ARNs and IPs reported verbatim.
 
 ## What the guardrail enforces
+
+<p align="center"><img src="../docs/diagrams/query-path.png" alt="The query path: the agent gets the context and writes SQL; check_query runs the guardrail and the estimate and sends refusals back with a reason; run_query checks again; you approve in the client prompt; the Athena workgroup runs it with a hard cutoff; the agent answers from at most 200 rows." width="840"></p>
 
 Every rule is checked on the parsed statement, in `check_query` and again in `run_query`:
 
